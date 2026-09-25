@@ -58,7 +58,6 @@ def test_webhook_secret_format():
 
 
 def test_timezone_validation():
-
     env = {"TELEGRAM_BOT_TOKEN": "t"}
     assert Settings.from_env({**env, "TIMEZONE": "Asia/Kolkata", "TZ": "UTC"}).timezone == "Asia/Kolkata"
     assert Settings.from_env({**env, "TZ": "Europe/Berlin"}).timezone == "Europe/Berlin"
