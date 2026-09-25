@@ -193,3 +193,56 @@ async def test_concurrent_turns_during_half_open_send_one_trial():
         assert h.fake.texts(OWNER) == ["back again"]
         assert h.fake.texts(2002)[0].startswith("echo: second")
         assert breaker.state == "closed"
+
+
+class Hung(Backend):
+    """Accepts the request, then never says anything (or stops after `head`)."""
+    name = "hung"
+
+    def __init__(self, head: str = ""):
+        self.head = head
+        self.cancelled = False
+
+    async def stream(self, turn):
+        import asyncio
+        if self.head:
+            yield TextDelta(self.head)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        yield
+
+
+async def test_silent_backend_fails_over_after_first_token_timeout():
+    hung = Hung()
+    async with harness(backends={"hung": hung, "echo": EchoBackend()}, default_backend="hung",
+                       fallback_backends=("echo",), first_token_timeout_s=0.2) as h:
+        h.fake.push_message(OWNER, "anyone?")
+        await h.pump()
+        (text,) = h.fake.texts(OWNER)
+        assert text.startswith("echo: anyone?")
+        assert text.endswith("<i>↪️ answered by echo; hung failed</i>")
+        assert hung.cancelled  # the hung request was torn down, not leaked
+        assert h.bot.health.breakers["hung"].failures == 1
+
+
+async def test_backend_that_stalls_mid_reply_reports_instead_of_retrying():
+    async with harness(backends={"hung": Hung(head="half an ans"), "echo": EchoBackend()}, default_backend="hung",
+                       fallback_backends=("echo",), idle_timeout_s=0.2) as h:
+        h.fake.push_message(OWNER, "go")
+        await h.pump()
+        assert h.fake.texts(OWNER) == ["⚠️ hung: stalled, nothing new for 0.2s"]
+
+
+async def test_timeout_clock_stops_while_an_approval_is_open():
+    import asyncio
+    async with harness(first_token_timeout_s=0.1, idle_timeout_s=0.1) as h:
+        h.fake.push_message(OWNER, "!task deploy")
+        await h.pump(drain=False)
+        await asyncio.sleep(0.4)  # longer than both timeouts
+        prompt = h.fake.with_keyboard(OWNER)[0]
+        h.fake.push_callback(OWNER, prompt, "ap:1:1")
+        await h.pump()
+        assert h.fake.texts(OWNER)[0] == "Executed <code>deploy</code> (mock)."

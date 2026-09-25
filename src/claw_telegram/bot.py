@@ -50,6 +50,7 @@ TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", 
                    ".ini", ".cfg", ".html", ".xml", ".sh", ".sql", ".rs", ".go", ".java", ".c", ".h", ".cpp"}
 PREVIEW_CHARS = 1500  # shown in the chat when a long reply is sent as a file
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
+_END = object()
 
 
 def parse_export(raw: bytes) -> list[dict]:
@@ -355,7 +356,7 @@ class Bot:
     async def _stream_backend(self, name: str, turn: Turn, mid: int, committed: list[bool]) -> str:
         """Stream one backend's reply into the placeholder message and return the full text."""
         text, status, last_edit, shown = "", "", 0.0, ""
-        async for ev in self.backends[name].stream(turn):
+        async for ev in self._watched(name, self.backends[name].stream(turn), turn.chat_id):
             if isinstance(ev, TextDelta):
                 text += ev.text
                 status = ""
@@ -374,6 +375,46 @@ class Bot:
                     await self._safe_edit(turn.chat_id, mid, live)
                     shown, last_edit = live, now
         return text
+
+    def _approval_pending(self, chat_id: int) -> bool:
+        return any(c == chat_id for c, _, _ in self._prompts.values())
+
+    async def _watched(self, name: str, events, chat_id: int):
+        """Pass backend events through, failing with BackendError if the backend goes quiet.
+
+        The stream is consumed in one helper task (aiohttp ties its timers to a task) and handed
+        over through a queue, so a wait can time out without breaking the backend's own state.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+
+        async def pump():
+            try:
+                async for ev in events:
+                    await q.put(ev)
+            except Exception as e:  # handed to the consumer
+                await q.put(e)
+            else:
+                await q.put(_END)
+
+        task = asyncio.create_task(pump())
+        limit, what = self.s.first_token_timeout_s, "no response"
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), limit or None)
+                except asyncio.TimeoutError:
+                    if self._approval_pending(chat_id):
+                        continue  # the backend is waiting for the user, not stuck
+                    raise BackendError(f"{name}: {what} for {limit:g}s") from None
+                if item is _END:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                limit, what = self.s.idle_timeout_s, "stalled, nothing new"
+                yield item
+        finally:
+            task.cancel()
+            await asyncio.wait({task})
 
     async def _on_backend_event(self, name: str, turn: Turn, ev) -> None:
         if isinstance(ev, ApprovalRequest):

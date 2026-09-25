@@ -84,6 +84,10 @@ class Settings:
     history_limit: int = 40
     rate_limit_per_minute: int = 20
     approval_timeout_s: int = 300
+    # A backend that sends nothing for this long fails (and falls over if nothing was shown yet).
+    # The clock stops while an approval prompt is open in the chat. 0 = no limit.
+    first_token_timeout_s: float = 180
+    idle_timeout_s: float = 300
     stream_edit_interval_s: float = 1.2
     long_reply_file_chars: int = 12000  # longer replies arrive as a .md file (0 = never)
     timezone: str = ""  # IANA name for /remind and /every; empty = the host's local time
@@ -150,6 +154,8 @@ class Settings:
             history_limit=int(e.get("HISTORY_LIMIT", cls.history_limit)),
             rate_limit_per_minute=int(e.get("RATE_LIMIT_PER_MINUTE", cls.rate_limit_per_minute)),
             approval_timeout_s=int(e.get("APPROVAL_TIMEOUT_S", cls.approval_timeout_s)),
+            first_token_timeout_s=float(e.get("FIRST_TOKEN_TIMEOUT_S", cls.first_token_timeout_s)),
+            idle_timeout_s=float(e.get("IDLE_TIMEOUT_S", cls.idle_timeout_s)),
             stream_edit_interval_s=float(e.get("STREAM_EDIT_INTERVAL_S", cls.stream_edit_interval_s)),
             long_reply_file_chars=int(e.get("LONG_REPLY_FILE_CHARS", cls.long_reply_file_chars)),
             timezone=e.get("TIMEZONE") or e.get("TZ", ""),
