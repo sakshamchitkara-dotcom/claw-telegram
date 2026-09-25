@@ -1,19 +1,23 @@
 """End-to-end run: real bot process <-> fake Telegram Bot API <-> a backend.
 
 Starts the fake Telegram server in this process, launches `python -m claw_telegram`
-as a subprocess pointed at it, plays a scripted conversation (including an
-approval click) and prints the transcript as the user would see it.
+as a subprocess pointed at it, plays a scripted conversation (approvals, failover,
+reminders, a group chat, pagination, export) and prints the transcript as the
+users would see it. Exits non-zero if an expected reply is missing.
 
     python scripts/e2e_fake_telegram.py                     # echo/mock backend
     python scripts/e2e_fake_telegram.py --backend openai \\
-        --env OPENAI_BASE_URL=http://localhost:11434/v1 --env OPENAI_MODEL=hermes3:3b
+        --env OPENAI_BASE_URL=http://localhost:11434/v1 --env OPENAI_MODEL=hermes3:3b \\
+        --say "Hello" --say "/status"
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -25,13 +29,19 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 from fake_telegram import FakeTelegram  # noqa: E402
 
-OWNER, STRANGER = 4242, 999
+OWNER, STRANGER, GROUP = 4242, 999, -100777
+BOT = "claw_test_bot"
 
 
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def approval_prompts(fake: FakeTelegram, chat: int) -> list[dict]:
+    return [m for m in fake.with_keyboard(chat)
+            if m["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("ap:")]
 
 
 async def wait_idle(fake: FakeTelegram, settle: float = 1.5, timeout: float = 600) -> None:
@@ -48,9 +58,9 @@ async def wait_idle(fake: FakeTelegram, settle: float = 1.5, timeout: float = 60
         if loop.time() - quiet_since < settle:
             continue
         # "…" placeholder or a "⏳ status" line means an agent turn is still running
-        running = [m for m in fake.sent(OWNER) if m["text"] == "…" or m["text"].startswith("⏳")
+        running = [m for m in fake.sent() if m["text"] == "…" or m["text"].startswith("⏳")
                    or "\n\n⏳ " in m["text"]]
-        if not running or fake.with_keyboard(OWNER):
+        if not running or any(approval_prompts(fake, c) for c in (OWNER, GROUP)):
             return
     raise TimeoutError("bot did not go idle")
 
@@ -61,18 +71,46 @@ def show(fake: FakeTelegram, since: int, chat: int = OWNER) -> int:
         kb = m.get("reply_markup", {}).get("inline_keyboard")
         extra = f"  [buttons: {' | '.join(b['text'] for b in kb[0])}]" if kb else ""
         mode = f" ({m['parse_mode']}, {m.get('edits', 0)} edits)" if m.get("parse_mode") or m.get("edits") else ""
-        print(f"  bot{mode}: {m['text']}{extra}".replace("\n", "\n       "))
+        text = m["text"] if len(m["text"]) < 600 else f"{m['text'][:60]}... ({len(m['text'])} chars)"
+        print(f"  bot{mode}: {text}{extra}".replace("\n", "\n       "))
     return len(msgs)
+
+
+# (who, text) steps; who is "owner", "stranger", "group" (owner writing in a group), or "wait" (seconds)
+DEMO = [
+    ("stranger", "hi"),
+    ("owner", "/start"),
+    ("owner", "Hello! What can you do?"),
+    ("owner", "!task rm -rf ./build"),
+    ("owner", "/tasks"),
+    ("owner", "/backend openai"),
+    ("owner", "Are you there?"),  # openai is down -> falls back to echo
+    ("owner", "/backend"),
+    ("owner", "/backend echo"),
+    ("owner", "x" * 4000),  # the echo is longer than one message -> Show more
+    ("owner", "/remind 2s stand up"),
+    ("wait", "3"),
+    ("owner", "/every 0 9 * * 1-5 summarise my inbox"),
+    ("owner", "/schedules"),
+    ("group", "just chatting, not for the bot"),
+    ("group", f"@{BOT} hello from the group"),
+    ("owner", "/export"),
+    ("owner", "/audit"),
+    ("owner", "/status"),
+]
+EXPECT = ["Not authorized", "Executed <code>rm -rf ./build</code>", "answered by echo; openai failed",
+          "openai: unreachable", "◀ Prev", "⏰ Reminder: stand up", "🔁 #2", "echo: hello from the group",
+          "approve by user 4242"]
 
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default="echo")
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE for the bot process")
-    ap.add_argument("--say", action="append", help="messages to send (default: scripted demo)")
+    ap.add_argument("--say", action="append", help="owner messages to send instead of the scripted demo")
     args = ap.parse_args()
 
-    fake = FakeTelegram()
+    fake = FakeTelegram(bot_username=BOT)
     runner = web.AppRunner(fake.app)
     await runner.setup()
     tg_port = free_port()
@@ -82,36 +120,53 @@ async def main() -> int:
     env = {**os.environ, "TELEGRAM_BOT_TOKEN": fake.token, "TELEGRAM_API_BASE": f"http://127.0.0.1:{tg_port}",
            "ALLOWED_USER_IDS": str(OWNER), "DEFAULT_BACKEND": args.backend, "DB_PATH": f"{db}/bot.db",
            "HTTP_HOST": "127.0.0.1", "HTTP_PORT": str(health_port), "STREAM_EDIT_INTERVAL_S": "0.3",
-           "LOG_LEVEL": "WARNING"}
+           "LOG_LEVEL": "WARNING", "ALLOWED_GROUP_IDS": str(GROUP), "TIMEZONE": "UTC"}
+    if not args.say:  # a dead OpenAI-compatible backend to fail over from
+        env.update(OPENAI_BASE_URL=f"http://127.0.0.1:{free_port()}/v1", OPENAI_MODEL="dead",
+                   FALLBACK_BACKENDS="echo", HEALTH_INTERVAL_S="0")
     env.update(kv.split("=", 1) for kv in args.env)
     proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "claw_telegram", env=env, cwd=ROOT)
     print(f"bot pid {proc.pid}, fake Telegram on :{tg_port}, backend={args.backend}\n")
+    steps = [("owner", t) for t in args.say] if args.say else DEMO
     try:
         await asyncio.sleep(1.5)
-        seen = {OWNER: 0, STRANGER: 0}
-        script = args.say or ["/start", "Hello! What can you do?", "!task rm -rf ./build", "/tasks", "/status"]
-
-        print(f"stranger {STRANGER}: hi")
-        fake.push_message(STRANGER, "hi")
-        await wait_idle(fake)
-        seen[STRANGER] = show(fake, 0, STRANGER)
-
-        for text in script:
-            print(f"\nowner {OWNER}: {text}")
-            fake.push_message(OWNER, text)
+        seen = {OWNER: 0, STRANGER: 0, GROUP: 0}
+        for who, text in steps:
+            if who == "wait":
+                print(f"\n(waiting {text}s)")
+                await asyncio.sleep(float(text))
+                await wait_idle(fake)
+                seen[OWNER] = show(fake, seen[OWNER])
+                continue
+            uid, chat = {"owner": (OWNER, OWNER), "stranger": (STRANGER, STRANGER), "group": (OWNER, GROUP)}[who]
+            label = f"owner {OWNER} in group {GROUP}" if who == "group" else f"{who} {uid}"
+            print(f"\n{label}: {text if len(text) < 200 else text[:40] + f'... ({len(text)} chars)'}")
+            fake.push_message(uid, text, chat_id=chat)
             await wait_idle(fake)
-            seen[OWNER] = show(fake, seen[OWNER])
-            pending = [m for m in fake.with_keyboard(OWNER)]
-            for prompt in pending:
+            seen[chat] = show(fake, seen[chat], chat)
+            for prompt in approval_prompts(fake, chat):
                 data = prompt["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
                 print(f"\nowner {OWNER}: [taps Approve -> {data}]")
-                before = {id(m): m["text"] for m in fake.sent(OWNER)}
+                before = {id(m): m["text"] for m in fake.sent(chat)}
                 fake.push_callback(OWNER, prompt, data)
                 await wait_idle(fake)
-                for m in fake.sent(OWNER):
+                for m in fake.sent(chat):
                     if before.get(id(m)) not in (None, m["text"]):
                         print(f"  bot (edited): {m['text']}".replace("\n", "\n       "))
-                seen[OWNER] = show(fake, seen[OWNER])
+                seen[chat] = show(fake, seen[chat], chat)
+            paged = [m for m in fake.sent(chat) if any(b["text"] == "Show more ▶" for b in
+                                                     (m.get("reply_markup", {}).get("inline_keyboard") or [[]])[0])]
+            for m in paged[-1:] if len(text) > 200 else []:
+                data = m["reply_markup"]["inline_keyboard"][0][-1]["callback_data"]
+                fake.push_callback(OWNER, m, data)
+                await wait_idle(fake)
+                print(f"\nowner {OWNER}: [taps Show more -> {data}]\n  bot (edited, page 2): ...{m['text'][-60:]!r}"
+                      f"  [buttons: {' | '.join(b['text'] for b in m['reply_markup']['inline_keyboard'][0])}]")
+        for d in fake.documents:
+            body = d["data"].decode()
+            summary = f"{len(json.loads(body)['messages'])} messages" if d["document"]["file_name"].endswith(
+                ".json") else f"{len(body)} chars"
+            print(f"\ndocument sent: {d['document']['file_name']} ({d['caption']}) -> {summary}")
 
         import aiohttp
         async with aiohttp.ClientSession() as http, http.get(f"http://127.0.0.1:{health_port}/healthz") as r:
@@ -121,6 +176,15 @@ async def main() -> int:
         code = await proc.wait()
         print(f"bot exited with {code}")
         await runner.cleanup()
+        shutil.rmtree(db, ignore_errors=True)
+    if not args.say:
+        everything = "\n".join(m["text"] for m in fake.sent()) + "\n" + "\n".join(
+            b["text"] for m in fake.sent() for row in (m.get("reply_markup") or {}).get("inline_keyboard", [])
+            for b in row)
+        missing = [e for e in EXPECT if e not in everything]
+        if missing or not fake.documents:
+            print(f"MISSING from transcript: {missing or 'export document'}")
+            return 1
     return 0
 
 
