@@ -1,0 +1,44 @@
+# Bot only:                 docker compose up -d
+# Bot + local Ollama:       docker compose --profile ollama up -d
+#                           (set OPENAI_BASE_URL=http://ollama:11434/v1, OPENAI_MODEL=hermes3)
+# Bot + Hermes Agent:       docker compose --profile hermes up -d
+#                           (set HERMES_URL=http://hermes:8642 and the same HERMES_API_KEY for both)
+services:
+  bot:
+    build: .
+    image: claw-telegram
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/claw-telegram.db
+    volumes:
+      - bot-data:/data
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"   # healthz + webhook; put a TLS proxy in front for webhooks
+
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    # Pull a Hermes model once:  docker compose exec ollama ollama pull hermes3
+
+  hermes:
+    profiles: ["hermes"]
+    # Hermes Agent ships a Dockerfile but (as of writing) no published image, so build from source.
+    build: https://github.com/NousResearch/hermes-agent.git
+    image: hermes-agent
+    restart: unless-stopped
+    environment:
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0          # only reachable on the compose network (no ports: published)
+      API_SERVER_PORT: "8642"
+      API_SERVER_KEY: ${HERMES_API_KEY:-}      # must match HERMES_API_KEY in .env
+    volumes:
+      - hermes-data:/opt/data           # run `docker compose run --rm hermes hermes setup` once
+
+volumes:
+  bot-data:
+  ollama:
+  hermes-data:
