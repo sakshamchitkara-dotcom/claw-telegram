@@ -62,6 +62,7 @@ class FakeTelegram:
         self.messages: dict[tuple[int, int], dict] = {}  # (chat_id, message_id) -> message
         self.files: dict[str, bytes] = {}
         self.webhook: dict | None = None
+        self.documents: list[dict] = []  # sent with sendDocument, including their bytes
         self._updates: list[dict] = []
         self._update_ids = itertools.count(1)
         self._msg_ids = itertools.count(100)
@@ -116,7 +117,12 @@ class FakeTelegram:
 
     async def _method(self, request: web.Request) -> web.Response:
         method = request.match_info["method"]
-        params = await request.json() if request.can_read_body else {}
+        if request.content_type == "multipart/form-data":
+            form = await request.post()
+            params = {k: (v if isinstance(v, str) else {"filename": v.filename, "data": v.file.read(),
+                                                        "content_type": v.content_type}) for k, v in form.items()}
+        else:
+            params = await request.json() if request.can_read_body else {}
         self.calls.append((method, params))
         handler = getattr(self, f"_m_{method}", None)
         if handler is None:
@@ -190,6 +196,20 @@ class FakeTelegram:
             msg["reply_markup"] = p["reply_markup"]
         else:
             msg.pop("reply_markup", None)
+        return self._ok(msg)
+
+    async def _m_sendDocument(self, p):
+        doc = p.get("document")
+        if not isinstance(doc, dict):
+            return self._err(400, "Bad Request: there is no document in the request")
+        if len(p.get("caption", "")) > 1024:
+            return self._err(400, "Bad Request: message caption is too long")
+        msg = {"message_id": next(self._msg_ids), "chat": {"id": int(p["chat_id"])}, "date": int(time.time()),
+               "document": {"file_name": doc["filename"], "mime_type": doc["content_type"],
+                            "file_size": len(doc["data"])}, "caption": p.get("caption")}
+        if p.get("message_thread_id"):
+            msg["message_thread_id"] = int(p["message_thread_id"])
+        self.documents.append({**msg, "data": doc["data"]})
         return self._ok(msg)
 
     async def _m_answerCallbackQuery(self, p):

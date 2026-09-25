@@ -92,6 +92,22 @@ class Telegram:
         except TelegramError:
             pass  # cosmetic
 
+    async def send_document(self, chat_id: int, filename: str, data: bytes, caption: str | None = None,
+                            thread_id: int | None = None, mime: str = "text/markdown") -> dict:
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption[:1024])
+        if thread_id:
+            form.add_field("message_thread_id", str(thread_id))
+        form.add_field("document", data, filename=filename, content_type=mime)
+        async with self._session.post(f"{self._base}/sendDocument", data=form,
+                                      timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            body = await resp.json(content_type=None)
+        if not body.get("ok"):
+            raise TelegramError("sendDocument", body.get("error_code", resp.status), body.get("description", ""))
+        return body["result"]
+
     async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         await self.call("answerCallbackQuery", callback_query_id=callback_id, text=text)
 

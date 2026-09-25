@@ -42,6 +42,7 @@ MAX_TEXT_DOC_BYTES = 200 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yaml", ".yml", ".toml",
                    ".ini", ".cfg", ".html", ".xml", ".sh", ".sql", ".rs", ".go", ".java", ".c", ".h", ".cpp"}
+PREVIEW_CHARS = 1500  # shown in the chat when a long reply is sent as a file
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
 
 
@@ -437,6 +438,9 @@ class Bot:
 
     async def _deliver(self, chat_id: int, mid: int, md: str, thread: int = 0) -> None:
         """Replace the placeholder with the formatted reply, splitting as needed."""
+        if 0 < self.s.long_reply_file_chars < len(md):
+            await self._deliver_file(chat_id, mid, md, thread)
+            return
         try:
             chunks, mode = render(md), "HTML"
             await self.tg.edit_message(chat_id, mid, chunks[0], parse_mode=mode)
@@ -450,6 +454,22 @@ class Bot:
             except TelegramError:
                 for part in split_plain(chunk):
                     await self.tg.send_message(chat_id, part, thread_id=thread)
+
+    async def _deliver_file(self, chat_id: int, mid: int, md: str, thread: int) -> None:
+        """Very long reply: a short preview in the chat, the whole thing as a Markdown file."""
+        name = f"reply-{datetime.now(self.tz):%Y%m%d-%H%M%S}.md"
+        preview = render(md[:PREVIEW_CHARS].rstrip() + "\n…")[0]
+        note = f"\n\n📄 Full reply ({len(md):,} chars) attached as {name}."
+        try:
+            await self.tg.edit_message(chat_id, mid, preview + note, parse_mode="HTML")
+        except TelegramError:
+            await self._safe_edit(chat_id, mid, md[:PREVIEW_CHARS] + "\n…" + note)
+        try:
+            await self.tg.send_document(chat_id, name, md.encode(), thread_id=thread)
+        except TelegramError as e:
+            log.warning("sendDocument failed (%s), sending as messages", e)
+            for part in split_plain(md):
+                await self.tg.send_message(chat_id, part, thread_id=thread)
 
     # ---- commands -----------------------------------------------------------------
 

@@ -106,7 +106,7 @@ async def test_streaming_edits_and_long_reply_split_with_html():
             for i in range(300):
                 yield TextDelta(f"**line {i}** <x> & some filler text to make it long\n")
 
-    async with harness(backends={"long": Long()}, default_backend="long") as h:
+    async with harness(backends={"long": Long()}, default_backend="long", long_reply_file_chars=0) as h:
         h.fake.push_message(OWNER, "go")
         await h.pump()
         sent = h.fake.sent(OWNER)
@@ -138,3 +138,21 @@ async def test_busy_chat_rejects_concurrent_message():
         texts = h.fake.texts(OWNER)
         assert "Still working on your previous message, one moment." in texts
         assert "done" in texts
+
+
+async def test_very_long_reply_arrives_as_markdown_file():
+    class Huge(Backend):
+        name = "huge"
+
+        async def stream(self, turn):
+            yield TextDelta("# Report\n\n" + "".join(f"- item {i} <x>\n" for i in range(2000)))
+
+    async with harness(backends={"huge": Huge()}, default_backend="huge", timezone="UTC") as h:
+        h.fake.push_message(OWNER, "go", thread=None)
+        await h.pump()
+        (preview,) = h.fake.sent(OWNER)
+        assert preview["parse_mode"] == "HTML" and preview["text"].startswith("<b>Report</b>")
+        assert "📄 Full reply (" in preview["text"] and "item 1999" not in preview["text"]
+        (doc,) = h.fake.documents
+        assert doc["document"]["file_name"].startswith("reply-") and doc["document"]["file_name"].endswith(".md")
+        assert doc["data"].decode().endswith("- item 1999 <x>")  # raw Markdown, not HTML
