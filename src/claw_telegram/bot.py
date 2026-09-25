@@ -476,13 +476,18 @@ class Bot:
 
         task = asyncio.create_task(pump())
         limit, what = self.s.first_token_timeout_s, "no response"
+        waited = False  # an approval was open at the last check
         try:
             while True:
                 try:
                     item = await asyncio.wait_for(q.get(), limit or None)
                 except asyncio.TimeoutError:
                     if self._approval_pending(chat_id):
+                        waited = True
                         continue  # the backend is waiting for the user, not stuck
+                    if waited:  # answered since the last check: the backend gets a full window from here
+                        waited = False
+                        continue
                     raise BackendError(f"{name}: {what} for {limit:g}s") from None
                 if item is _END:
                     return
