@@ -72,3 +72,24 @@ def test_local_zone_follows_the_host_zone_name(tmp_path):
     from zoneinfo import ZoneInfoNotFoundError
     with pytest.raises(ZoneInfoNotFoundError):
         local_zone("Not/AZone")
+
+
+def test_durations_are_real_time_across_dst():
+    # Berlin leaves summer time on 2026-10-25 at 03:00 CEST -> 02:00 CET
+    before = datetime(2026, 10, 25, 0, 30, tzinfo=TZ)
+    assert parse_when("3h", before).timestamp() - before.timestamp() == 3 * 3600
+    assert next_run("3h", before).timestamp() - before.timestamp() == 3 * 3600
+
+
+def test_cron_runs_once_in_the_repeated_hour():
+    second_pass = datetime(2026, 10, 25, 2, 10, fold=1, tzinfo=TZ)  # 02:10 CET, after 02:20 CEST already ran
+    nxt = Cron("20 2 * * *").next_after(second_pass)
+    assert nxt.timestamp() > second_pass.timestamp()
+    assert nxt == datetime(2026, 10, 26, 2, 20, tzinfo=TZ)
+
+
+def test_cron_time_in_the_skipped_hour_fires_just_after_the_jump():
+    # Berlin skips 02:00-03:00 on 2026-03-29
+    nxt = Cron("30 2 * * *").next_after(datetime(2026, 3, 29, 1, 0, tzinfo=TZ))
+    assert nxt.timestamp() == datetime(2026, 3, 29, 3, 30, tzinfo=TZ).timestamp()
+    assert (nxt.hour, nxt.minute) == (3, 30)  # shown as the time it really fires
