@@ -30,6 +30,7 @@ COMMANDS = [
     ("backend", "Show or switch the agent backend"),
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
+    ("cancel", "Stop the reply that is running in this chat"),
     ("remind", "Remind me: /remind 10m text, /remind 14:30 text"),
     ("every", "Repeat a prompt: /every 0 9 * * * prompt, /every 2h prompt"),
     ("schedules", "List reminders and repeating prompts"),
@@ -126,6 +127,8 @@ class Bot:
         self.health = Health(backends, settings.circuit_failures, settings.circuit_cooldown_s)
         self._busy: dict[tuple[int, int], str] = {}  # (chat, topic) -> backend name of the in-flight turn
         self._committed: dict[tuple[int, int], list[bool]] = {}  # (chat, topic) -> has the user seen output?
+        self._turns: dict[tuple[int, int], asyncio.Task] = {}  # (chat, topic) -> the running turn
+        self._stop_note: dict[tuple[int, int], str] = {}  # why a turn was cancelled, shown in its message
         self._tasks: set[asyncio.Task] = set()
         self._chat_tail: dict[int, asyncio.Task] = {}  # chat -> its newest queued update
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
@@ -303,7 +306,7 @@ class Bot:
         turn = Turn(chat_id=ctx.chat_id, session_id=self.store.session_id(*ctx.key), text=text,
                     history=self.store.history(ctx.chat_id, self.s.history_limit, ctx.thread_id), images=images,
                     thread_id=ctx.thread_id)
-        self.spawn(self._run_turn(self.chain(name, ctx.role, bool(images)), turn))
+        self._turns[ctx.key] = self.spawn(self._run_turn(self.chain(name, ctx.role, bool(images)), turn))
 
     def backend_name(self, chat_id: int, thread: int = 0) -> str:
         name = self.store.backend_for(chat_id, thread)
@@ -322,12 +325,22 @@ class Bot:
         finally:
             self._busy.pop((turn.chat_id, turn.thread_id), None)
             self._committed.pop((turn.chat_id, turn.thread_id), None)
+            self._turns.pop((turn.chat_id, turn.thread_id), None)
+            self._stop_note.pop((turn.chat_id, turn.thread_id), None)
 
     async def _stream_turn(self, names: list[str], turn: Turn) -> None:
         chat_id = turn.chat_id
         await self.tg.send_chat_action(chat_id, thread_id=turn.thread_id)
         placeholder = await self.tg.send_message(chat_id, "…", thread_id=turn.thread_id)
         mid = placeholder["message_id"]
+        try:
+            await self._try_backends(names, turn, mid)
+        except asyncio.CancelledError:  # /cancel or shutdown; nothing is stored
+            await self._safe_edit(chat_id, mid, self._stop_note.get((chat_id, turn.thread_id), "⏹ Stopped."))
+            raise
+
+    async def _try_backends(self, names: list[str], turn: Turn, mid: int) -> None:
+        chat_id = turn.chat_id
         failed: list[tuple[str, BackendError]] = []
         for i, name in enumerate(names):
             self._busy[(chat_id, turn.thread_id)] = name
@@ -486,17 +499,25 @@ class Bot:
 
     async def _expire(self, tid: int, chat_id: int, mid: int, text: str) -> None:
         await asyncio.sleep(self.s.approval_timeout_s)
-        self._timers.pop(tid, None)
-        self._prompts.pop(tid, None)
+        self._timers.pop(tid, None)  # this task; don't let _auto_deny cancel it
+        await self._auto_deny(tid, "expired", "expire", f"no answer in {self.s.approval_timeout_s}s",
+                              f"⌛ No answer in {self.s.approval_timeout_s}s: denied.")
+
+    async def _auto_deny(self, tid: int, status: str, action: str, detail: str, note: str) -> None:
+        """Deny a pending approval nobody answered: record it, tell the backend, update the prompt."""
+        if timer := self._timers.pop(tid, None):
+            timer.cancel()
+        prompt = self._prompts.pop(tid, None)
         task = self.store.get_task(tid)
-        if task and self.store.resolve_task(tid, "expired"):
-            self.store.audit("expire", chat_id=chat_id, task_id=tid,
-                             detail=f"no answer in {self.s.approval_timeout_s}s")
-            try:
-                await self.backends[task.backend].resolve_approval(task.ref, False)
-            except BackendError as e:
-                log.warning("could not deny expired approval %s: %s", tid, e)
-            await self._safe_edit(chat_id, mid, f"{text}\n\n⌛ No answer in {self.s.approval_timeout_s}s: denied.")
+        if not task or not self.store.resolve_task(tid, status):
+            return
+        self.store.audit(action, chat_id=task.chat_id, task_id=tid, detail=detail)
+        try:
+            await self.backends[task.backend].resolve_approval(task.ref, False)
+        except (BackendError, KeyError) as e:
+            log.warning("could not deny approval %s: %s", tid, e)
+        if prompt:
+            await self._safe_edit(prompt[0], prompt[1], f"{prompt[2]}\n\n{note}")
 
     async def _on_callback(self, cq: dict) -> None:
         user = cq.get("from")
@@ -645,6 +666,20 @@ class Bot:
             f"messages stored: {self.store.count_messages(*ctx.key)}",
             f"uptime: {up // 3600}h{up % 3600 // 60:02d}m",
         ]))
+
+    async def cmd_cancel(self, ctx: Ctx, arg: str) -> None:
+        task = self._turns.get(ctx.key)
+        if task is None:
+            await self.reply(ctx, "Nothing is running here.")
+            return
+        who = (ctx.msg.get("from") or {}).get("username") or str(ctx.user_id)
+        self._stop_note[ctx.key] = f"⏹ Cancelled by {who}."
+        for tid, (chat_id, _, _) in list(self._prompts.items()):  # the turn may be waiting on one
+            if chat_id == ctx.chat_id:
+                await self._auto_deny(tid, "cancelled", "cancel", f"turn cancelled by user {ctx.user_id}",
+                                      "⏹ Cancelled: denied.")
+        task.cancel()
+        await asyncio.wait({task})
 
     async def cmd_tasks(self, ctx: Ctx, arg: str) -> None:
         chat_id = ctx.chat_id
