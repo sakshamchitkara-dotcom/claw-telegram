@@ -27,6 +27,7 @@ COMMANDS = [
     ("start", "Introduction"),
     ("help", "What I can do"),
     ("reset", "Forget this conversation"),
+    ("summarize", "Condense a long conversation into a summary the chat continues from"),
     ("backend", "Show or switch the agent backend"),
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
@@ -49,6 +50,9 @@ MAX_IMPORT_MESSAGES = 10_000
 EXPORT_FORMAT = "claw-telegram/conversation"
 TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yaml", ".yml", ".toml",
                    ".ini", ".cfg", ".html", ".xml", ".sh", ".sql", ".rs", ".go", ".java", ".c", ".h", ".cpp"}
+SUMMARY_PROMPT = ("Summarize our conversation so far so that it can replace the transcript. Keep every fact "
+                  "I told you, names, decisions, numbers, and open questions or tasks. Use short bullet points "
+                  "and no preamble.")
 PREVIEW_CHARS = 1500  # shown in the chat when a long reply is sent as a file
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
 _END = object()
@@ -130,6 +134,7 @@ class Bot:
         self._committed: dict[tuple[int, int], list[bool]] = {}  # (chat, topic) -> has the user seen output?
         self._turns: dict[tuple[int, int], asyncio.Task] = {}  # (chat, topic) -> the running turn
         self._stop_note: dict[tuple[int, int], str] = {}  # why a turn was cancelled, shown in its message
+        self._compacting: set[tuple[int, int]] = set()  # /summarize turns: the reply replaces the history
         self._tasks: set[asyncio.Task] = set()
         self._chat_tail: dict[int, asyncio.Task] = {}  # chat -> its newest queued update
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
@@ -321,7 +326,7 @@ class Bot:
             text = f"{text}\n\nAttached file {name}:\n```\n{body}\n```".strip()
         return text, images, None
 
-    async def _start_turn(self, ctx: Ctx, text: str, images: list) -> None:
+    async def _start_turn(self, ctx: Ctx, text: str, images: list, compact: bool = False) -> None:
         if ctx.key in self._busy:
             await self.reply(ctx, "Still working on your previous message, one moment.")
             return
@@ -338,6 +343,8 @@ class Bot:
         turn = Turn(chat_id=ctx.chat_id, session_id=self.store.session_id(*ctx.key), text=text,
                     history=self.store.history(ctx.chat_id, self.s.history_limit, ctx.thread_id), images=images,
                     thread_id=ctx.thread_id, user_id=ctx.user_id)
+        if compact:
+            self._compacting.add(ctx.key)
         self._turns[ctx.key] = self.spawn(self._run_turn(self.chain(name, ctx.role, bool(images)), turn))
 
     def backend_name(self, chat_id: int, thread: int = 0) -> str:
@@ -359,6 +366,7 @@ class Bot:
             self._committed.pop((turn.chat_id, turn.thread_id), None)
             self._turns.pop((turn.chat_id, turn.thread_id), None)
             self._stop_note.pop((turn.chat_id, turn.thread_id), None)
+            self._compacting.discard((turn.chat_id, turn.thread_id))
 
     async def _stream_turn(self, names: list[str], turn: Turn) -> None:
         chat_id = turn.chat_id
@@ -407,11 +415,20 @@ class Bot:
             breaker.success()
             break
         text = text.strip() or "(empty reply)"
-        self.store.add_message(chat_id, "user", turn.text, turn.thread_id)
-        self.store.add_message(chat_id, "assistant", text, turn.thread_id)
+        note = ""
+        if (chat_id, turn.thread_id) in self._compacting and not self.backends[name].stateful:
+            # the summary becomes the whole history; stateless backends get it with every later turn
+            before = self.store.count_messages(chat_id, turn.thread_id)
+            self.store.replace_messages(chat_id, turn.thread_id, [{"role": "user", "content": turn.text},
+                                                                  {"role": "assistant", "content": text}])
+            note = f"\n\n*🗜 This summary replaced {before} stored messages.*"
+        else:
+            self.store.add_message(chat_id, "user", turn.text, turn.thread_id)
+            self.store.add_message(chat_id, "assistant", text, turn.thread_id)
         self.store.add_usage(turn.user_id, self._today(), len(turn.text), len(text))
         if failed:  # shown, not stored: it isn't part of the conversation
             text += f"\n\n*↪️ answered by {name}; {', '.join(n for n, _ in failed)} failed*"
+        text += note
         await self._deliver(chat_id, mid, text, turn.thread_id)
 
     async def _stream_backend(self, name: str, turn: Turn, mid: int, committed: list[bool]) -> str:
@@ -669,6 +686,12 @@ class Bot:
     async def cmd_reset(self, ctx: Ctx, arg: str) -> None:
         self.store.reset(*ctx.key)
         await self.reply(ctx, "Conversation cleared. New session started.")
+
+    async def cmd_summarize(self, ctx: Ctx, arg: str) -> None:
+        if self.store.count_messages(*ctx.key) < 2:
+            await self.reply(ctx, "Nothing to summarize yet.")
+            return
+        await self._start_turn(ctx, SUMMARY_PROMPT, [], compact=True)
 
     async def cmd_backend(self, ctx: Ctx, arg: str) -> None:
         chat_id = ctx.chat_id
