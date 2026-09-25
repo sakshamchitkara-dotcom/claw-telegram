@@ -9,27 +9,32 @@ A Telegram bot that acts as your personal assistant by talking to a **self-hoste
 - an **echo/mock** backend for tests and dry runs
 
 Replies stream into Telegram by editing a message as tokens arrive. When the agent wants to do something
-with side effects, you get an **Approve / Deny** keyboard first.
+with side effects, you get an **Approve / Deny** keyboard first. If a backend goes down, the next backend in
+your fallback list answers instead.
 
 ```
 Telegram ──► claw-telegram ──► OpenClaw gateway  (/v1/chat/completions + WS exec approvals)
    ▲              │       └──► Hermes Agent      (/v1/chat/completions + /v1/runs/{id}/approval)
    │  keyboard    │       └──► Ollama / vLLM / OpenRouter (OpenAI-compatible)
-   └──────────────┘       └──► Claude API (fallback)
-        sqlite: per-chat history, backend choice, session ids, approval log
+   └──────────────┘       └──► Claude API
+        failover chain + circuit breakers + health probes
+        sqlite: per-chat/topic history, backend choice, session ids, users, audit log, schedules, pages
 ```
 
 ## Features
 
 | | |
 |---|---|
-| Auth | Deny-by-default allowlist of Telegram user IDs. Strangers get their ID back in private chats and are ignored in groups. Callback buttons are checked the same way, and a button only works in the chat it was sent to. |
-| Modes | Long polling (default) or webhook with Telegram's secret-token header, compared in constant time. |
-| Memory | Per-chat history in SQLite. Stateful backends (OpenClaw) get only the newest turn plus a stable per-chat session id. `/reset` clears history and rotates the session. |
-| Commands | `/start` `/help` `/reset` `/backend [name]` `/status` `/tasks` |
-| Streaming | Throttled `editMessageText` while tokens arrive, with a `⏳ tool` status line. The final reply is re-rendered as Telegram HTML from a safe Markdown subset (code fences, inline code, bold, italic, strike, headings, http(s) links). Long replies are split at 4096 chars without breaking code blocks. Falls back to plain text if Telegram rejects the markup. |
+| Auth | Deny by default. Roles: **owner**, **admin**, **user**, each with its own allowed backends and approval rights. Admins manage users with `/users`. Strangers get their ID back in private chats and are ignored in groups. Callback buttons are checked the same way, and a button only works in the chat it was sent to. |
+| Groups | Only in groups listed in `ALLOWED_GROUP_IDS`, and only for @mentions, replies to the bot, and commands. Forum topics are separate conversations. |
+| Modes | Long polling (default) or webhook. Webhooks check Telegram's secret-token header in constant time, can be limited to an IP allowlist (with trusted-proxy `X-Forwarded-For`), and drop redelivered updates. |
+| Memory | Per-chat (and per-topic) history in SQLite. Stateful backends (OpenClaw) get only the newest turn plus a stable session id. `/reset` clears history and rotates the session. `/export` and `/import` move a conversation as JSON. |
+| Failover | Ordered `FALLBACK_BACKENDS`, per-backend circuit breakers, and background health probes. `/backend` shows health, circuit state and the order the next turn will try. |
+| Schedules | `/remind 10m text` and `/every <cron> <prompt>` (a backend prompt run on a schedule, with the answer posted to the chat). Stored in sqlite, so they survive restarts. |
+| Commands | `/start` `/help` `/reset` `/backend [name]` `/status` `/tasks` `/remind` `/every` `/schedules` `/unschedule` `/export` `/import` `/users` `/audit` |
+| Streaming | Throttled `editMessageText` while tokens arrive, with a `⏳ tool` status line. The final reply is re-rendered as Telegram HTML from a safe Markdown subset (code fences, inline code, bold, italic, strike, headings, http(s) links). Replies longer than one message are paged in place with **Show more** buttons, without breaking code blocks. Very long ones arrive as a `.md` file. Falls back to plain text if Telegram rejects the markup. |
 | Media | Photos and image documents go to backends that accept images (data-URL `image_url` parts / Claude image blocks). Small text files are inlined. Voice notes are transcribed through any OpenAI-compatible `/audio/transcriptions` endpoint. |
-| Agent actions | Backend approval requests become persisted tasks with an inline keyboard. Each can be answered once, only by an allowlisted user, and is **denied automatically** after `APPROVAL_TIMEOUT_S`. `/tasks` shows the log. |
+| Agent actions | Backend approval requests become persisted tasks with an inline keyboard. Each can be answered once, only by a role that is allowed to approve, and is **denied automatically** after `APPROVAL_TIMEOUT_S`. Every decision goes to an audit table: `/tasks` shows the chat's tasks and `/audit` shows the full log. |
 | Ops | Per-user rate limit, one in-flight turn per chat, `/healthz`, Dockerfile, docker-compose (with optional Ollama and Hermes Agent), hardened systemd unit, CI. |
 
 ## Quick start
@@ -45,7 +50,54 @@ Telegram ──► claw-telegram ──► OpenClaw gateway  (/v1/chat/completio
    ```
 
 3. Run `set -a; . ./.env; set +a; claw-telegram`, message your bot and it will tell you your user ID. Put that
-   ID in `ALLOWED_USER_IDS` and restart. Until then **nobody** can use the bot.
+   ID in `OWNER_IDS` (or `ALLOWED_USER_IDS`) and restart. Until then **nobody** can use the bot.
+
+### Users and roles
+
+| Role | Set with | Default rights |
+|---|---|---|
+| owner | `OWNER_IDS` | every backend, approves actions, manages admins and users |
+| admin | `ADMIN_IDS` or `/users add <id> admin` (owners only) | every backend, approves actions, manages users, `/audit` |
+| user | `ALLOWED_USER_IDS` or `/users add <id>` | every backend, **can't approve** |
+
+`ROLE_BACKENDS_USER=echo,openai` limits a role to some backends (`*` or empty = all). `ROLE_APPROVE_USER=true`
+lets a role approve. If `OWNER_IDS` is empty, everyone in `ALLOWED_USER_IDS` is an owner, as in 0.1.
+
+### Groups and topics
+
+Add the bot to a group, send `/start@yourbot` and it replies with the group's ID. Put that ID in
+`ALLOWED_GROUP_IDS`. In the group it answers `@yourbot ...`, replies to its own messages, and commands. Other
+messages are ignored, and each sender still needs a role. In forum supergroups every topic has its own history
+and backend. With BotFather's privacy mode on (the default) Telegram only delivers those messages anyway.
+
+### Failover
+
+```bash
+DEFAULT_BACKEND=openclaw
+FALLBACK_BACKENDS=hermes,openai   # tried in this order
+HEALTH_INTERVAL_S=60              # background probes; a failed probe opens the circuit
+CIRCUIT_FAILURES=3                # consecutive turn failures that open it
+CIRCUIT_COOLDOWN_S=60             # then one trial turn is let through
+```
+
+A turn falls back only if the backend fails **before** the user has seen output or an approval prompt, so a
+half-streamed answer or a pending action is never run twice. The reply is labelled with the backend that
+answered it. The label isn't stored in history. Fallbacks respect the sender's role and skip backends
+that don't take images when the turn has a photo.
+
+### Schedules
+
+```
+/remind 25m take the pizza out
+/remind 07:30 standup notes
+/remind 2026-10-01T09:00 renew the domain
+/every 0 9 * * 1-5 Summarise my calendar for today
+/every 2h Check the build status and tell me if anything is red
+/schedules            /unschedule 3
+```
+
+Times use `TIMEZONE` (IANA name, default: the host's local time). `/every` runs the prompt through the chat's
+backend. Approval prompts from that run work as usual. Plain users can have up to `MAX_SCHEDULES_PER_USER`.
 
 ### Backends
 
@@ -64,15 +116,24 @@ Telegram ──► claw-telegram ──► OpenClaw gateway  (/v1/chat/completio
 - **Docker:** `docker compose up -d`. Add `--profile ollama` or `--profile hermes` to run a backend next to
   the bot on a private compose network. See the comments in `docker-compose.yml`.
 - **systemd:** `deploy/claw-telegram.service` (instructions at the top of the file).
-- **Webhook:** set `BOT_MODE=webhook`, `WEBHOOK_URL=https://your.host` and a random `WEBHOOK_SECRET`, and route
-  `https://your.host/telegram/webhook` to `HTTP_PORT` through a TLS proxy. `/healthz` is served in both modes.
+- **Webhook:** set `BOT_MODE=webhook`, `WEBHOOK_URL=https://your.host` and a random `WEBHOOK_SECRET`
+  (16-256 chars of `A-Za-z0-9_-`, e.g. `openssl rand -hex 32`), and route `https://your.host/telegram/webhook`
+  to `HTTP_PORT` through a TLS proxy. Add `WEBHOOK_IP_ALLOWLIST=telegram` to accept only Telegram's published
+  ranges, and `WEBHOOK_TRUSTED_PROXIES=127.0.0.1` (your proxy) so the client IP is read from
+  `X-Forwarded-For`. `/healthz` is served in both modes.
 
 ## Security model
 
 - **The bot is an operator console for your agent.** An OpenClaw gateway token or Hermes API key has
-  owner-level power: shell, files, and whatever tools you enabled. Keep `ALLOWED_USER_IDS` to yourself.
-- Empty allowlist means nobody gets in. An invalid ID in the list stops the bot at startup instead of being skipped.
-- Approvals: only allowlisted users can press the buttons, only in the originating chat, only once. Timeouts deny.
+  owner-level power: shell, files, and whatever tools you enabled. Give other people the `user` role and
+  restrict their backends with `ROLE_BACKENDS_USER`. Any role can still *chat* with a backend it's allowed
+  to use, and a prompt alone can make an agent act on its own tools.
+- Empty allowlist means nobody gets in, and no group works until it's listed. An invalid ID or CIDR stops the
+  bot at startup instead of being skipped.
+- Approvals: only roles with approval rights can press the buttons, only in the originating chat, only once.
+  Timeouts deny. Every request and decision is written to the audit table.
+- `/import` accepts only `user`/`assistant` messages (no system prompts) and is admin-only in groups.
+  Scheduled prompts run with the rights of the user who created them. They stop if that user loses access.
 - For OpenClaw approvals the bot connects with scopes `operator.read`, `operator.approvals` and `operator.admin`
   and the `exec-approvals` cap (see below for why). The shared gateway token already carries that authority.
 - Secrets come from the environment only. `.env` is gitignored, and the Telegram token is never logged.
@@ -100,12 +161,16 @@ Checked against the upstream docs **and** against live local installs (OpenClaw 
 | OpenAI-compatible adapter against Ollama | **Confirmed live** with `hermes3:3b` (streaming, code blocks, multi-turn memory) |
 | Claude adapter request shape (`claude-opus-5-5`, `output_config.effort`, no `thinking`/sampling params, refusal handling) | **Checked against the SDK and a fake Messages API only**. No API key was available for a live call. |
 | Voice transcription via `/audio/transcriptions` | **Tested against a fake endpoint only** |
+| Failover Hermes Agent → Ollama (OpenAI-compatible) when the Hermes gateway stops, and back when it returns | **Confirmed live** (see observed runs) |
+| Telegram forum topics: `message_thread_id` + `is_topic_message`, and the implicit reply to the topic-creation message | **From the Bot API docs**, tested against the fake Bot API only |
+| Mention/reply detection in groups, `reply_parameters`, `sendDocument` multipart upload | **From the Bot API docs**, tested against the fake Bot API only |
+| Telegram webhook source ranges `149.154.160.0/20`, `91.108.4.0/22` | **From Telegram's webhook guide**. They could change; the list is only used if you opt in with `telegram`. |
 
 ## Development
 
 ```bash
 pip install -e '.[claude,dev]'
-ruff check src tests scripts && pytest -q          # 65 tests, no network needed
+ruff check src tests scripts && pytest -q          # 109 tests, no network needed
 python scripts/e2e_fake_telegram.py               # real bot process <-> fake Telegram <-> mock backend
 python scripts/e2e_fake_telegram.py --backend openai \
   --env OPENAI_BASE_URL=http://localhost:11434/v1 --env OPENAI_MODEL=hermes3:3b
@@ -158,12 +223,80 @@ $ ls /tmp/claude-501/hh-demo
 ls: /tmp/claude-501/hh-demo: No such file or directory
 ```
 
-(Answer quality in these runs comes from the small local models. The bot passes their output through unchanged.)
+Live failover (0.2.0): Hermes Agent API server as the primary, Ollama `hermes3:3b` over the OpenAI-compatible
+API as the fallback, `HEALTH_INTERVAL_S=5`. The Hermes gateway was stopped and restarted during the run:
+
+```
+owner 4242: /backend
+  bot: Backends (• = this chat):
+         echo: ok [closed]
+       • hermes: live; models: ok (1 models, hermes-agent present) [closed]
+         openai: ok (4 models, hermes3:3b present) [closed]
+       Next turn tries: hermes → openai
+owner 4242: Reply with exactly one word: pong
+  bot: pong
+--- stopping Hermes gateway ---
+owner 4242: Reply with exactly one word: pong
+WARNING claw_telegram.bot: backend hermes failed: hermes: cannot reach http://127.0.0.1:8642/v1 (ClientConnectorError: ...)
+  bot (HTML, 3 edits): ping
+       <i>↪️ answered by openai; hermes failed</i>
+owner 4242: /backend
+  bot: Backends (• = this chat):
+         echo: ok [closed]
+       • hermes: unreachable (ClientConnectorError) [open, retry in 60s, 2 failures]
+         openai: ok (4 models, hermes3:3b present) [closed]
+       Next turn tries: openai
+owner 4242: What is 2+2? Answer with just the number.
+  bot: 4                                    (hermes skipped: circuit open)
+--- restarting Hermes gateway; the next 5 s probe sees it and half-opens the circuit ---
+owner 4242: Reply with exactly one word: pong
+  bot: pong                                 (trial turn on hermes succeeded)
+owner 4242: /backend
+  bot: • hermes: live; models: ok (1 models, hermes-agent present) [closed]
+       Next turn tries: hermes → openai
+```
+
+Fake Telegram, mock backend: the 0.2.0 parts of `scripts/e2e_fake_telegram.py` (the real bot process, with a dead
+OpenAI-compatible backend to fail over from):
+
+```
+owner 4242: /backend openai
+  bot: Switched to openai.
+owner 4242: Are you there?
+  bot (HTML, 3 edits): echo: Are you there?
+       (history: 4 msgs)
+       <i>↪️ answered by echo; openai failed</i>
+owner 4242: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... (4000 chars)
+  bot (HTML, 2 edits): echo: xxxx... (3486 chars)  [buttons: 1/2 | Show more ▶]
+owner 4242: [taps Show more -> pg:1:1]
+  bot (edited, page 2): ...'xxxxxxxxxx\n(history: 6 msgs)'  [buttons: ◀ Prev | 2/2]
+owner 4242: /remind 2s stand up
+  bot: ⏰ Reminder #1 set for Fri 2026-09-25 09:31 UTC.
+(waiting 3s)
+  bot: ⏰ Reminder: stand up
+owner 4242: /every 0 9 * * 1-5 summarise my inbox
+  bot: 🔁 #2 runs `0 9 * * 1-5` on this chat's backend. Next: Mon 2026-09-28 09:00 UTC.
+owner 4242 in group -100777: just chatting, not for the bot
+owner 4242 in group -100777: @claw_test_bot hello from the group
+  bot (HTML, 2 edits): echo: hello from the group
+owner 4242: /audit
+  bot: 2026-09-25 09:32:08 request by system task #1 chat 4242: echo: run shell: rm -rf ./build
+       2026-09-25 09:32:10 approve by user 4242 task #1 chat 4242: run shell: rm -rf ./build
+document sent: conversation-4242-20260925-093146.json (8 messages. Restore with /import.) -> 8 messages
+```
+
+(Answer quality in these runs comes from the small local models: `ping` for "pong" is what `hermes3:3b`
+actually said. The bot passes model output through unchanged.)
 
 ## Limitations
 
 - Plugin approvals (`plugin.approval.*`) and Hermes' `session`/`always` choices are not exposed. Approve means once.
 - Updates are handled in order. A long voice transcription delays other chats' updates in polling mode.
+- A backend that hangs rather than failing (no error, no tokens) only fails over when its HTTP timeout
+  (600 s) runs out. There is no separate first-token timeout.
+- Without `TIMEZONE`, schedules use the host's UTC offset at startup, so a DST change needs a restart. Cron
+  runs in local wall-clock time, so a run inside a DST gap or overlap can move by an hour.
+- The half-open circuit state lets every concurrent turn through, not exactly one trial.
 
 ## License
 
