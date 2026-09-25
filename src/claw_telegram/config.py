@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 from dataclasses import dataclass, field
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -121,6 +122,9 @@ class Settings:
         secret = e.get("WEBHOOK_SECRET", "")
         if mode == "webhook" and not secret:
             raise SystemExit("WEBHOOK_SECRET is required in webhook mode")
+        if secret and not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", secret):
+            # Telegram allows 1-256 of these characters; we also insist on a guess-resistant length.
+            raise SystemExit("WEBHOOK_SECRET must be 16-256 characters of A-Z a-z 0-9 _ -")
         return cls(
             telegram_token=token,
             telegram_api_base=e.get("TELEGRAM_API_BASE", cls.telegram_api_base).rstrip("/"),

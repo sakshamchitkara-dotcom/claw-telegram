@@ -54,13 +54,19 @@ async def test_webhook_checks_secret_and_dispatches():
             async with http.post(url + WEBHOOK_PATH, json=update,
                                  headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"}) as r:
                 assert r.status == 401
-            async with http.post(url + WEBHOOK_PATH, json=update,
+            for _ in range(2):  # the second delivery is a redelivery of the same update
+                async with http.post(url + WEBHOOK_PATH, json=update,
+                                     headers={"X-Telegram-Bot-Api-Secret-Token": "s3cret"}) as r:
+                    assert r.status == 200
+            async with http.post(url + WEBHOOK_PATH, json=[1, 2],
                                  headers={"X-Telegram-Bot-Api-Secret-Token": "s3cret"}) as r:
-                assert r.status == 200
+                assert r.status == 400
             await h.bot.drain()
             async with http.get(url + "/healthz") as r:
-                assert (await r.json())["updates"] == 1
-        assert h.fake.texts(OWNER)[0].startswith("echo: via webhook")
+                health = await r.json()
+                assert health["updates"] == 1 and health["duplicates"] == 1
+        (reply,) = h.fake.texts(OWNER)
+        assert reply.startswith("echo: via webhook")
 
 
 async def test_webhook_mode_registers_with_telegram(tmp_path):

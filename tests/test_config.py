@@ -47,3 +47,11 @@ def test_webhook_ip_allowlist_parsing():
     assert [str(n) for n in s.webhook_ip_allowlist] == ["149.154.160.0/20", "91.108.4.0/22", "203.0.113.7/32"]
     with pytest.raises(ValueError):
         Settings.from_env({"TELEGRAM_BOT_TOKEN": "t", "WEBHOOK_IP_ALLOWLIST": "10.0.0.0/33"})
+
+
+def test_webhook_secret_format():
+    base = {"TELEGRAM_BOT_TOKEN": "t", "BOT_MODE": "webhook"}
+    for bad in ["short", "has spaces in it!!!!", "x" * 257]:
+        with pytest.raises(SystemExit):
+            Settings.from_env(base | {"WEBHOOK_SECRET": bad})
+    assert Settings.from_env(base | {"WEBHOOK_SECRET": "A-good_secret_0123456789"}).webhook_secret

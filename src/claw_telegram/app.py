@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import hmac
 import ipaddress
 import logging
@@ -41,8 +42,9 @@ def client_ip(remote: str | None, forwarded_for: str,
 
 def make_web_app(bot: Bot, settings: Settings) -> web.Application:
     app = web.Application(client_max_size=4 * 1024 * 1024)
-    stats = {"updates": 0, "last_update": None}
+    stats = {"updates": 0, "last_update": None, "duplicates": 0}
     app[STATS] = stats
+    recent: collections.OrderedDict[int, None] = collections.OrderedDict()  # update_ids already accepted
 
     async def healthz(request: web.Request) -> web.Response:
         return web.json_response({
@@ -65,6 +67,14 @@ def make_web_app(bot: Bot, settings: Settings) -> web.Application:
             update = await request.json()
         except ValueError:
             return web.Response(status=400)
+        if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+            return web.Response(status=400)
+        if update["update_id"] in recent:  # Telegram redelivers when an ack was slow or lost
+            stats["duplicates"] += 1
+            return web.Response(text="ok")
+        recent[update["update_id"]] = None
+        if len(recent) > 1000:
+            recent.popitem(last=False)
         stats["updates"] += 1
         stats["last_update"] = int(time.time())
         bot.spawn(bot.handle_update(update))  # ack fast; Telegram retries slow webhooks
