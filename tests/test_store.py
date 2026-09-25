@@ -56,3 +56,34 @@ def test_audit_log_newest_first_and_per_chat():
     assert [e.action for e in s.audit_log()] == ["deny", "user.add", "approve"]
     only = s.audit_log(chat_id=10)
     assert len(only) == 1 and only[0].task_id == 3 and only[0].detail == "rm -rf x"
+
+
+def test_topics_are_separate_conversations():
+    s = Store(":memory:")
+    s.add_message(-100, "user", "main")
+    s.add_message(-100, "user", "in topic", thread=7)
+    s.set_backend(-100, "hermes", thread=7)
+    s.reset(-100, thread=7)
+    assert s.history(-100, 10) == [{"role": "user", "content": "main"}]
+    assert s.count_messages(-100, thread=7) == 0
+    assert s.backend_for(-100) is None and s.backend_for(-100, 7) == "hermes"
+    assert s.session_id(-100) == "telegram--100-0" and s.session_id(-100, 7) == "telegram--100-t7-1"
+
+
+def test_migrates_a_0_1_database(tmp_path):
+    import sqlite3
+
+    from claw_telegram.store import MIGRATIONS, SCHEMA
+
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.executescript(SCHEMA.split("CREATE TABLE IF NOT EXISTS users")[0])  # exactly the 0.1.0 tables
+    old.execute("INSERT INTO messages (chat_id, role, content, created) VALUES (1, 'user', 'kept', 0)")
+    old.execute("INSERT INTO chats (chat_id, backend, epoch) VALUES (1, 'hermes', 3)")
+    old.commit()
+    old.close()
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+    assert s.history(1, 10) == [{"role": "user", "content": "kept"}]
+    assert s.backend_for(1) == "hermes" and s.session_id(1) == "telegram-1-3"
+    Store(path)  # reopening is a no-op

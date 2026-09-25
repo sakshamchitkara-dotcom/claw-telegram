@@ -1,4 +1,9 @@
-"""SQLite persistence: per-chat history, backend choice, session epoch, agent tasks."""
+"""SQLite persistence: per-conversation history, backend choice, session epoch, agent tasks.
+
+A conversation is a chat, or one forum topic (thread) inside a chat; thread 0
+means "no topic". SCHEMA is the 0.1 baseline plus new tables; MIGRATIONS
+upgrade it in order and PRAGMA user_version records how far a database got.
+"""
 
 from __future__ import annotations
 
@@ -61,6 +66,26 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 """
 
+MIGRATIONS = [
+    # 1: forum topics get their own history, backend and session
+    """
+    ALTER TABLE messages ADD COLUMN thread_id INTEGER NOT NULL DEFAULT 0;
+    DROP INDEX messages_chat;
+    CREATE INDEX messages_chat ON messages (chat_id, thread_id, id);
+    ALTER TABLE schedules ADD COLUMN thread_id INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE chats_new (
+        chat_id INTEGER NOT NULL,
+        thread_id INTEGER NOT NULL DEFAULT 0,
+        backend TEXT,
+        epoch INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, thread_id)
+    );
+    INSERT INTO chats_new (chat_id, backend, epoch) SELECT chat_id, backend, epoch FROM chats;
+    DROP TABLE chats;
+    ALTER TABLE chats_new RENAME TO chats;
+    """,
+]
+
 
 @dataclass
 class Task:
@@ -94,6 +119,7 @@ class Schedule:
     text: str
     next_run: float
     runs: int
+    thread_id: int = 0
 
 
 class Store:
@@ -104,42 +130,49 @@ class Store:
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        for i, sql in enumerate(MIGRATIONS[version:], version + 1):
+            self.db.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version = {i};\nCOMMIT;")
 
-    def add_message(self, chat_id: int, role: str, content: str) -> None:
-        self.db.execute("INSERT INTO messages (chat_id, role, content, created) VALUES (?, ?, ?, ?)",
-                        (chat_id, role, content, time.time()))
+    def add_message(self, chat_id: int, role: str, content: str, thread: int = 0) -> None:
+        self.db.execute("INSERT INTO messages (chat_id, thread_id, role, content, created) VALUES (?, ?, ?, ?, ?)",
+                        (chat_id, thread, role, content, time.time()))
 
-    def history(self, chat_id: int, limit: int) -> list[dict]:
+    def history(self, chat_id: int, limit: int, thread: int = 0) -> list[dict]:
         rows = self.db.execute(
-            "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (chat_id, limit)
-        ).fetchall()
+            "SELECT role, content FROM messages WHERE chat_id = ? AND thread_id = ? ORDER BY id DESC LIMIT ?",
+            (chat_id, thread, limit)).fetchall()
         msgs = [{"role": r, "content": c} for r, c in reversed(rows)]
         while msgs and msgs[0]["role"] != "user":  # APIs want the first turn to be the user's
             msgs.pop(0)
         return msgs
 
-    def count_messages(self, chat_id: int) -> int:
-        return self.db.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,)).fetchone()[0]
+    def count_messages(self, chat_id: int, thread: int = 0) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND thread_id = ?",
+                               (chat_id, thread)).fetchone()[0]
 
-    def _chat(self, chat_id: int) -> tuple[str | None, int]:
-        row = self.db.execute("SELECT backend, epoch FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
+    def _chat(self, chat_id: int, thread: int) -> tuple[str | None, int]:
+        row = self.db.execute("SELECT backend, epoch FROM chats WHERE chat_id = ? AND thread_id = ?",
+                              (chat_id, thread)).fetchone()
         return row if row else (None, 0)
 
-    def backend_for(self, chat_id: int) -> str | None:
-        return self._chat(chat_id)[0]
+    def backend_for(self, chat_id: int, thread: int = 0) -> str | None:
+        return self._chat(chat_id, thread)[0]
 
-    def set_backend(self, chat_id: int, backend: str) -> None:
-        self.db.execute("INSERT INTO chats (chat_id, backend) VALUES (?, ?) "
-                        "ON CONFLICT(chat_id) DO UPDATE SET backend = excluded.backend", (chat_id, backend))
+    def set_backend(self, chat_id: int, backend: str, thread: int = 0) -> None:
+        self.db.execute("INSERT INTO chats (chat_id, thread_id, backend) VALUES (?, ?, ?) "
+                        "ON CONFLICT(chat_id, thread_id) DO UPDATE SET backend = excluded.backend",
+                        (chat_id, thread, backend))
 
-    def session_id(self, chat_id: int) -> str:
+    def session_id(self, chat_id: int, thread: int = 0) -> str:
         """Stable per-conversation id for stateful backends; rotates on /reset."""
-        return f"telegram-{chat_id}-{self._chat(chat_id)[1]}"
+        topic = f"-t{thread}" if thread else ""
+        return f"telegram-{chat_id}{topic}-{self._chat(chat_id, thread)[1]}"
 
-    def reset(self, chat_id: int) -> None:
-        self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        self.db.execute("INSERT INTO chats (chat_id, epoch) VALUES (?, 1) "
-                        "ON CONFLICT(chat_id) DO UPDATE SET epoch = epoch + 1", (chat_id,))
+    def reset(self, chat_id: int, thread: int = 0) -> None:
+        self.db.execute("DELETE FROM messages WHERE chat_id = ? AND thread_id = ?", (chat_id, thread))
+        self.db.execute("INSERT INTO chats (chat_id, thread_id, epoch) VALUES (?, ?, 1) "
+                        "ON CONFLICT(chat_id, thread_id) DO UPDATE SET epoch = epoch + 1", (chat_id, thread))
 
     def create_task(self, chat_id: int, backend: str, ref: str, summary: str) -> int:
         cur = self.db.execute("INSERT INTO tasks (chat_id, backend, ref, summary, created) VALUES (?, ?, ?, ?, ?)",
@@ -202,12 +235,13 @@ class Store:
 
     # ---- scheduled reminders and prompts -------------------------------------
 
-    _SCHED = "SELECT id, chat_id, user_id, kind, spec, text, next_run, runs FROM schedules"
+    _SCHED = "SELECT id, chat_id, user_id, kind, spec, text, next_run, runs, thread_id FROM schedules"
 
-    def add_schedule(self, chat_id: int, user_id: int, kind: str, spec: str, text: str, next_run: float) -> int:
-        return self.db.execute("INSERT INTO schedules (chat_id, user_id, kind, spec, text, next_run, created) "
-                               "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                               (chat_id, user_id, kind, spec, text, next_run, time.time())).lastrowid
+    def add_schedule(self, chat_id: int, user_id: int, kind: str, spec: str, text: str, next_run: float,
+                     thread: int = 0) -> int:
+        return self.db.execute("INSERT INTO schedules (chat_id, thread_id, user_id, kind, spec, text, next_run, "
+                               "created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               (chat_id, thread, user_id, kind, spec, text, next_run, time.time())).lastrowid
 
     def due_schedules(self, now: float) -> list[Schedule]:
         return [Schedule(*r) for r in self.db.execute(f"{self._SCHED} WHERE next_run <= ? ORDER BY next_run",
