@@ -127,3 +127,29 @@ async def test_approval_answered_elsewhere_updates_prompt():
         await h.pump()
         answers = [p["text"] for m, p in h.fake.calls if m == "answerCallbackQuery"]
         assert answers == ["Already resolved."]
+
+
+async def test_out_of_band_approval_during_a_turn_blocks_failover():
+    import asyncio
+
+    from claw_telegram.backends.base import Backend, BackendError
+    from claw_telegram.backends.echo import EchoBackend
+
+    class Gateway(Backend):
+        """Raises its approval over a side channel, then its chat stream breaks."""
+        name = "openclaw"
+        approval_sink = None
+
+        async def stream(self, turn):
+            await self.approval_sink(ApprovalRequest("ap-1", "exec: rm -rf build"))
+            await asyncio.sleep(0)
+            raise BackendError("openclaw: connection reset")
+            yield
+
+    async with harness(backends={"openclaw": Gateway(), "echo": EchoBackend()}, default_backend="openclaw",
+                       fallback_backends=("echo",)) as h:
+        h.fake.push_message(OWNER, "clean the build")
+        await h.pump()
+        texts = h.fake.texts(OWNER)
+        assert "⚠️ openclaw: connection reset" in texts
+        assert not any(t.startswith("echo:") for t in texts)  # the fallback didn't run the request again

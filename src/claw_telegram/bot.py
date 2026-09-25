@@ -126,6 +126,7 @@ class Bot:
         self.me: dict = {"id": 0, "username": ""}  # filled by init()
         self.health = Health(backends, settings.circuit_failures, settings.circuit_cooldown_s)
         self._busy: dict[tuple[int, int], str] = {}  # (chat, topic) -> backend name of the in-flight turn
+        self._committed: dict[tuple[int, int], list[bool]] = {}  # (chat, topic) -> has the user seen output?
         self._tasks: set[asyncio.Task] = set()
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
         self._prompts: dict[int, tuple[int, int, str]] = {}  # task id -> (chat, message id, text)
@@ -304,6 +305,7 @@ class Bot:
             await self._stream_turn(names, turn)
         finally:
             self._busy.pop((turn.chat_id, turn.thread_id), None)
+            self._committed.pop((turn.chat_id, turn.thread_id), None)
 
     async def _stream_turn(self, names: list[str], turn: Turn) -> None:
         chat_id = turn.chat_id
@@ -314,6 +316,7 @@ class Bot:
         for i, name in enumerate(names):
             self._busy[(chat_id, turn.thread_id)] = name
             committed: list[bool] = []  # set once the user has seen output or an approval
+            self._committed[(chat_id, turn.thread_id)] = committed
             breaker = self.health.breakers[name]
             try:
                 if not breaker.begin():  # another turn is already the half-open trial
@@ -389,6 +392,8 @@ class Bot:
         chats = [c for c, n in self._busy.items() if n == name]
         if chats:
             chat_id, thread = chats[-1]
+            # the turn is waiting on this approval: failing over now could run the action twice
+            self._committed.get(chats[-1], []).append(True)
         elif self.s.owners:
             chat_id, thread = min(self.s.owners), 0
         else:
