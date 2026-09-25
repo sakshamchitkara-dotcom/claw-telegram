@@ -1,9 +1,10 @@
 """Backend health checks and per-backend circuit breakers for failover.
 
 A breaker opens after `threshold` consecutive failures (or one failed health
-probe) and stays open for `cooldown` seconds. After that it is half-open: the
-next turn is a trial, and its outcome closes or re-opens the breaker. A health
-probe that succeeds while the breaker is open makes it half-open early.
+probe) and stays open for `cooldown` seconds. After that it is half-open: exactly
+one turn is let through as a trial (`begin()` claims it), and its outcome closes
+or re-opens the breaker. A health probe that succeeds while the breaker is open
+makes it half-open early.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class Breaker:
         self.failures = 0
         self.opened_at: float | None = None
         self.last_error = ""
+        self.trial = False  # a half-open trial turn is in flight
 
     @property
     def state(self) -> str:
@@ -40,13 +42,27 @@ class Breaker:
         return "half-open" if self.clock() - self.opened_at >= self.cooldown else "open"
 
     def available(self) -> bool:
-        # ponytail: half-open lets every concurrent turn through, not exactly one trial; fine at chat volume.
-        return self.state != "open"
+        """Would a turn be let through right now? (Doesn't claim the half-open trial.)"""
+        state = self.state
+        return state == "closed" or (state == "half-open" and not self.trial)
+
+    def begin(self) -> bool:
+        """Claim the right to send a turn. In half-open state only the first caller gets it."""
+        if self.state == "half-open":
+            if self.trial:
+                return False
+            self.trial = True
+        return True  # closed, or open but tried anyway because every backend is down
+
+    def release(self) -> None:
+        """The claimed turn ended without a verdict on the backend (e.g. an internal error)."""
+        self.trial = False
 
     def success(self) -> None:
-        self.failures, self.opened_at = 0, None
+        self.failures, self.opened_at, self.trial = 0, None, False
 
     def failure(self, error: str, trip: bool = False) -> None:
+        self.trial = False
         self.failures += 1
         self.last_error = error
         # a failed half-open trial (opened_at still set) re-opens at once
@@ -98,6 +114,8 @@ class Health:
         state = b.state
         if state == "open":
             state += f", retry in {b.retry_in()}s"
+        if b.trial:
+            state += ", trial running"
         if b.failures:
             state += f", {b.failures} failure{'s' if b.failures != 1 else ''}"
         return f"{self.status.get(name, 'not checked yet')} [{state}]"

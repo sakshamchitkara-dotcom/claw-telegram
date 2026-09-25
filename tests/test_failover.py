@@ -143,3 +143,53 @@ async def test_backend_command_shows_health_circuits_and_order():
             "",
             "Switch with /backend <name>.",
         ]
+
+
+def test_half_open_admits_exactly_one_trial():
+    clock = Clock()
+    b = Breaker(threshold=1, cooldown=30, clock=clock)
+    b.failure("down")
+    assert not b.available()
+    assert b.begin()  # open, but a last-resort attempt is still allowed
+    b.failure("still down")
+    clock.t += 30
+    assert b.available() and b.begin()  # the trial
+    assert not b.available() and not b.begin()  # a concurrent turn is refused
+    b.release()  # the trial ended without a verdict
+    assert b.begin()
+    b.success()
+    assert b.state == "closed" and b.begin() and b.begin()
+
+
+async def test_concurrent_turns_during_half_open_send_one_trial():
+    import asyncio
+
+    gate = asyncio.Event()
+
+    class Recovering(Backend):
+        name = "rec"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def stream(self, turn):
+            self.calls += 1
+            await gate.wait()
+            yield TextDelta("back again")
+
+    rec = Recovering()
+    async with harness(backends={"rec": rec, "echo": EchoBackend()}, default_backend="rec",
+                       fallback_backends=("echo",), allowed_user_ids=frozenset({OWNER, 2002})) as h:
+        breaker = h.bot.health.breakers["rec"]
+        breaker.failure("down", trip=True)
+        breaker.opened_at -= breaker.cooldown  # cooldown over: half-open
+        h.fake.push_message(OWNER, "first")
+        h.fake.push_message(2002, "second")
+        await h.pump(drain=False)
+        await asyncio.sleep(0.05)
+        gate.set()
+        await h.bot.drain()
+        assert rec.calls == 1
+        assert h.fake.texts(OWNER) == ["back again"]
+        assert h.fake.texts(2002)[0].startswith("echo: second")
+        assert breaker.state == "closed"

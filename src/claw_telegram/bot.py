@@ -314,11 +314,20 @@ class Bot:
         for i, name in enumerate(names):
             self._busy[(chat_id, turn.thread_id)] = name
             committed: list[bool] = []  # set once the user has seen output or an approval
+            breaker = self.health.breakers[name]
             try:
-                text = await self._stream_backend(name, turn, mid, committed)
+                if not breaker.begin():  # another turn is already the half-open trial
+                    raise BackendError(f"{name}: recovering, another turn is testing it")
+                try:
+                    text = await self._stream_backend(name, turn, mid, committed)
+                except BackendError as e:
+                    breaker.failure(str(e))
+                    raise
+                except BaseException:
+                    breaker.release()
+                    raise
             except BackendError as e:
                 log.warning("backend %s failed: %s", name, e)
-                self.health.breakers[name].failure(str(e))
                 failed.append((name, e))
                 if committed or i == len(names) - 1:  # can't retry output the user already saw
                     msg = f"⚠️ {e}" if len(failed) == 1 else "⚠️ All backends failed:\n" + "\n".join(
@@ -331,7 +340,7 @@ class Bot:
                 log.exception("turn failed in chat %s", chat_id)
                 await self._safe_edit(chat_id, mid, "⚠️ Internal error, see bot logs.")
                 return
-            self.health.breakers[name].success()
+            breaker.success()
             break
         text = text.strip() or "(empty reply)"
         self.store.add_message(chat_id, "user", turn.text, turn.thread_id)
