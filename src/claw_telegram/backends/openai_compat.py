@@ -99,6 +99,10 @@ class OpenAICompatBackend(Backend):
                         delta = choice.get("delta") or {}
                         if delta.get("content"):
                             yield TextDelta(delta["content"])
+                        elif delta.get("reasoning") or delta.get("reasoning_content"):
+                            # Ollama sends `reasoning`, vLLM/DeepSeek `reasoning_content`; the text itself
+                            # isn't shown, but it proves the model is alive and tells the user why it's slow
+                            yield Status("thinking…")
                         for call in delta.get("tool_calls") or []:
                             name = (call.get("function") or {}).get("name")
                             if name:
