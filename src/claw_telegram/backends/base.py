@@ -48,6 +48,7 @@ class Turn:
     history: list[dict] = field(default_factory=list)  # prior [{"role","content"}] text turns
     images: list[Image] = field(default_factory=list)
     thread_id: int = 0  # forum topic, 0 = none
+    user_id: int = 0  # who asked (the creator, for scheduled prompts); used for usage accounting
 
 
 class BackendError(Exception):

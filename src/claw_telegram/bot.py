@@ -9,7 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
 from .config import ROLES, Settings
@@ -31,6 +31,7 @@ COMMANDS = [
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
     ("cancel", "Stop the reply that is running in this chat"),
+    ("usage", "Your replies today and this week (admins: /usage all)"),
     ("remind", "Remind me: /remind 10m text, /remind 14:30 text"),
     ("every", "Repeat a prompt: /every 0 9 * * * prompt, /every 2h prompt"),
     ("schedules", "List reminders and repeating prompts"),
@@ -328,10 +329,15 @@ class Bot:
         if not self.s.backend_allowed(ctx.role, name):
             await self.reply(ctx, f"Your role ({ctx.role}) can't use the {name} backend. Pick another with /backend.")
             return
+        limit = self.s.role_daily_turns.get(ctx.role, 0)
+        if limit and self.store.usage(ctx.user_id, self._today())[0] >= limit:
+            await self.reply(ctx, f"You've used your {limit} replies for today. The count resets at midnight "
+                                  f"({self._fmt_tz()}).")
+            return
         self._busy[ctx.key] = name
         turn = Turn(chat_id=ctx.chat_id, session_id=self.store.session_id(*ctx.key), text=text,
                     history=self.store.history(ctx.chat_id, self.s.history_limit, ctx.thread_id), images=images,
-                    thread_id=ctx.thread_id)
+                    thread_id=ctx.thread_id, user_id=ctx.user_id)
         self._turns[ctx.key] = self.spawn(self._run_turn(self.chain(name, ctx.role, bool(images)), turn))
 
     def backend_name(self, chat_id: int, thread: int = 0) -> str:
@@ -403,6 +409,7 @@ class Bot:
         text = text.strip() or "(empty reply)"
         self.store.add_message(chat_id, "user", turn.text, turn.thread_id)
         self.store.add_message(chat_id, "assistant", text, turn.thread_id)
+        self.store.add_usage(turn.user_id, self._today(), len(turn.text), len(text))
         if failed:  # shown, not stored: it isn't part of the conversation
             text += f"\n\n*↪️ answered by {name}; {', '.join(n for n, _ in failed)} failed*"
         await self._deliver(chat_id, mid, text, turn.thread_id)
@@ -791,6 +798,31 @@ class Bot:
             await self.reply(ctx, chunk)
 
     # ---- schedules --------------------------------------------------------------
+
+    def _today(self, days_ago: int = 0) -> str:
+        return (datetime.now(self.tz) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+    def _fmt_tz(self) -> str:
+        return datetime.now(self.tz).strftime("%Z") or str(self.tz)
+
+    async def cmd_usage(self, ctx: Ctx, arg: str) -> None:
+        today = self._today()
+        if arg == "all":
+            if not self._at_least(ctx, "admin"):
+                await self.reply(ctx, "Only admins can see everyone's usage.")
+                return
+            rows = self.store.usage_by_user(today)
+            lines = [f"{uid}: {turns} replies, {cin:,} chars in, {cout:,} out" for uid, turns, cin, cout in rows]
+            await self.reply(ctx, f"Usage on {today}:\n" + ("\n".join(lines) or "(nobody yet)"))
+            return
+        turns, cin, cout = self.store.usage(ctx.user_id, today)
+        week = self.store.usage(ctx.user_id, self._today(6))
+        limit = self.s.role_daily_turns.get(ctx.role, 0)
+        await self.reply(ctx, "\n".join([
+            f"Today: {turns}{f' of {limit}' if limit else ''} replies ({cin:,} chars in, {cout:,} out)",
+            f"Last 7 days: {week[0]} replies ({week[1]:,} chars in, {week[2]:,} out)",
+            f"Daily limit for your role ({ctx.role}): {limit or 'none'}",
+        ]))
 
     def _fmt(self, ts: float) -> str:
         return datetime.fromtimestamp(ts, self.tz).strftime("%a %Y-%m-%d %H:%M %Z").strip()

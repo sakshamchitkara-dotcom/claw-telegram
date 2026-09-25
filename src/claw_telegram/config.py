@@ -65,6 +65,8 @@ class Settings:
     role_backends: dict[str, frozenset[str] | None] = field(default_factory=dict)
     role_can_approve: dict[str, bool] = field(
         default_factory=lambda: {"owner": True, "admin": True, "user": False})
+    # Agent replies per user per day (in TIMEZONE), by role; 0 or missing = unlimited.
+    role_daily_turns: dict[str, int] = field(default_factory=dict)
     mode: str = "polling"  # polling | webhook
     webhook_url: str = ""
     webhook_secret: str = ""
@@ -138,6 +140,7 @@ class Settings:
             allowed_group_ids=_ids(e.get("ALLOWED_GROUP_IDS", "")),
             role_backends={r: _names(e.get(f"ROLE_BACKENDS_{r.upper()}")) for r in ROLES},
             role_can_approve={r: _bool(e.get(f"ROLE_APPROVE_{r.upper()}"), r != "user") for r in ROLES},
+            role_daily_turns={r: int(e.get(f"DAILY_TURNS_{r.upper()}") or 0) for r in ROLES},
             mode=mode,
             webhook_url=e.get("WEBHOOK_URL", ""),
             webhook_secret=secret,
