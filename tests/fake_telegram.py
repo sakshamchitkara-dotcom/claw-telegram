@@ -72,10 +72,14 @@ class FakeTelegram:
 
     # ---- helpers used by tests --------------------------------------------
 
-    def push_message(self, user_id: int, text: str | None = None, chat_id: int | None = None, **extra) -> dict:
+    def push_message(self, user_id: int, text: str | None = None, chat_id: int | None = None,
+                     thread: int | None = None, **extra) -> dict:
         chat_id = chat_id or user_id
-        msg = {"message_id": next(self._msg_ids), "date": int(time.time()),
-               "chat": {"id": chat_id, "type": "private" if chat_id == user_id else "group"},
+        chat = {"id": chat_id, "type": "private" if chat_id == user_id else "group"}
+        if thread:  # a forum topic in a supergroup
+            chat.update(type="supergroup", is_forum=True)
+            extra.update(message_thread_id=thread, is_topic_message=True)
+        msg = {"message_id": next(self._msg_ids), "date": int(time.time()), "chat": chat,
                "from": {"id": user_id, "is_bot": False, "first_name": f"user{user_id}"}, **extra}
         if text is not None:
             msg["text"] = text
@@ -162,6 +166,10 @@ class FakeTelegram:
                "parse_mode": p.get("parse_mode")}
         if p.get("reply_markup"):
             msg["reply_markup"] = p["reply_markup"]
+        if p.get("message_thread_id"):
+            msg["message_thread_id"] = p["message_thread_id"]
+        if p.get("reply_parameters"):
+            msg["reply_to"] = p["reply_parameters"]["message_id"]
         self.messages[(p["chat_id"], msg["message_id"])] = msg
         return self._ok(msg)
 

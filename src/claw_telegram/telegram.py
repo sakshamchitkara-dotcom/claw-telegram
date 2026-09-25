@@ -53,14 +53,27 @@ class Telegram:
             raise TelegramError(method, code, data.get("description", ""))
         raise AssertionError("unreachable")
 
+    async def get_me(self) -> dict:
+        return await self.call("getMe")
+
     async def get_updates(self, offset: int | None, timeout: int = 30) -> list[dict]:
         return await self.call("getUpdates", _http_timeout=timeout + 10, offset=offset, timeout=timeout,
                                allowed_updates=["message", "callback_query"])
 
+    @staticmethod
+    def _where(thread_id: int | None, reply_to: int | None) -> dict:
+        """Forum topic and reply target; a reply whose target is gone is still sent."""
+        out: dict[str, Any] = {"message_thread_id": thread_id or None}
+        if reply_to:
+            out["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        return out
+
     async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None,
-                           reply_markup: dict | None = None) -> dict:
+                           reply_markup: dict | None = None, thread_id: int | None = None,
+                           reply_to: int | None = None) -> dict:
         return await self.call("sendMessage", chat_id=chat_id, text=text, parse_mode=parse_mode,
-                               reply_markup=reply_markup, link_preview_options={"is_disabled": True})
+                               reply_markup=reply_markup, link_preview_options={"is_disabled": True},
+                               **self._where(thread_id, reply_to))
 
     async def edit_message(self, chat_id: int, message_id: int, text: str,
                            parse_mode: str | None = None, reply_markup: dict | None = None) -> Any:
@@ -73,9 +86,9 @@ class Telegram:
                 return None
             raise
 
-    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+    async def send_chat_action(self, chat_id: int, action: str = "typing", thread_id: int | None = None) -> None:
         try:
-            await self.call("sendChatAction", chat_id=chat_id, action=action)
+            await self.call("sendChatAction", chat_id=chat_id, action=action, message_thread_id=thread_id or None)
         except TelegramError:
             pass  # cosmetic
 

@@ -35,7 +35,8 @@ class HermesBackend(OpenAICompatBackend):
     def headers(self, turn: Turn | None) -> dict[str, str]:
         h = super().headers(turn)
         if turn is not None:
-            h["X-Hermes-Session-Key"] = f"telegram:{turn.chat_id}"
+            topic = f":{turn.thread_id}" if turn.thread_id else ""
+            h["X-Hermes-Session-Key"] = f"telegram:{turn.chat_id}{topic}"
         return h
 
     def on_event(self, event: str, payload: dict) -> Event | None:

@@ -55,8 +55,13 @@ class Ctx:
     """Who sent a message, where, and with which role."""
     chat_id: int
     user_id: int
-    role: str
+    role: str  # "" for strangers
     msg: dict
+    thread_id: int = 0  # forum topic, 0 = none
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.chat_id, self.thread_id
 
 
 class Bot:
@@ -72,7 +77,7 @@ class Bot:
         # ponytail: without TIMEZONE the host's current UTC offset is used, so DST changes need a restart.
         self.tz = ZoneInfo(settings.timezone) if settings.timezone else datetime.now().astimezone().tzinfo
         self._sched_wake = asyncio.Event()
-        self._busy: dict[int, str] = {}  # chat_id -> backend name of the in-flight turn
+        self._busy: dict[tuple[int, int], str] = {}  # (chat, topic) -> backend name of the in-flight turn
         self._tasks: set[asyncio.Task] = set()
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
         self._prompts: dict[int, tuple[int, int, str]] = {}  # task id -> (chat, message id, text)
@@ -115,41 +120,47 @@ class Bot:
 
     # ---- messages ---------------------------------------------------------------
 
+    async def reply(self, ctx: Ctx, text: str, **kw) -> dict:
+        """Send into the conversation (and topic) the context came from."""
+        return await self.tg.send_message(ctx.chat_id, text, thread_id=ctx.thread_id, **kw)
+
     async def _on_message(self, msg: dict) -> None:
         chat_id = msg["chat"]["id"]
         user = msg.get("from")
         role = self.role_of(user)
+        thread = msg.get("message_thread_id", 0) if msg.get("is_topic_message") else 0
+        ctx = Ctx(chat_id, (user or {}).get("id", 0), role or "", msg, thread)
         if role is None:
             uid = (user or {}).get("id")
             log.warning("denied message from user %s in chat %s", uid, chat_id)
             if msg["chat"].get("type") == "private":
-                await self.tg.send_message(chat_id, f"Not authorized. Your Telegram user id is {uid}; "
+                await self.reply(ctx, f"Not authorized. Your Telegram user id is {uid}; "
                                                     "the bot owner must add it to ALLOWED_USER_IDS.")
             return
         if not self.limiter.allow(user["id"]):
-            await self.tg.send_message(chat_id, "Rate limit reached, please wait a minute.")
+            await self.reply(ctx, "Rate limit reached, please wait a minute.")
             return
-        ctx = Ctx(chat_id, user["id"], role, msg)
         text = msg.get("text") or msg.get("caption") or ""
         if text.startswith("/"):
             cmd, _, arg = text[1:].partition(" ")
             await self._command(ctx, cmd.split("@")[0].lower(), arg.strip())
             return
         try:
-            text, images, problem = await self._attachments(chat_id, msg, text)
+            text, images, problem = await self._attachments(ctx, text)
         except TelegramError as e:
             text, images, problem = "", [], f"Could not download the attachment ({e.description})."
         if problem:
-            await self.tg.send_message(chat_id, problem)
+            await self.reply(ctx, problem)
             return
         if not text.strip() and not images:
-            await self.tg.send_message(chat_id, "Send me text, a photo, a document or a voice note.")
+            await self.reply(ctx, "Send me text, a photo, a document or a voice note.")
             return
         await self._start_turn(ctx, text, images)
 
-    async def _attachments(self, chat_id: int, msg: dict, text: str) -> tuple[str, list[Image], str | None]:
+    async def _attachments(self, ctx: Ctx, text: str) -> tuple[str, list[Image], str | None]:
         """Pull photos/documents into the turn. Returns (text, images, problem-to-report)."""
-        backend = self.backends[self.backend_name(chat_id)]
+        msg = ctx.msg
+        backend = self.backends[self.backend_name(*ctx.key)]
         images: list[Image] = []
         doc = msg.get("document")
         voice = msg.get("voice") or msg.get("audio")
@@ -157,14 +168,14 @@ class Bot:
             if self.transcriber is None:
                 return text, [], "Voice notes need a transcription endpoint (set TRANSCRIBE_URL)."
             audio = await self.tg.download_file(voice["file_id"], MAX_AUDIO_BYTES)
-            await self.tg.send_chat_action(chat_id, "typing")
+            await self.tg.send_chat_action(ctx.chat_id, "typing", ctx.thread_id)
             try:
                 heard = await self.transcriber(audio, voice.get("file_name") or "voice.ogg")
             except TranscriptionError as e:
                 return text, [], f"Transcription failed: {e}"
             if not heard:
                 return text, [], "I couldn't hear anything in that voice note."
-            await self.tg.send_message(chat_id, f"🎙 {heard[:4000]}")
+            await self.reply(ctx, f"🎙 {heard[:4000]}")
             text = f"{text}\n\n{heard}".strip()
         elif msg.get("photo") or (doc and (doc.get("mime_type") or "").startswith("image/")):
             if not backend.supports_images:
@@ -185,35 +196,35 @@ class Bot:
         return text, images, None
 
     async def _start_turn(self, ctx: Ctx, text: str, images: list) -> None:
-        chat_id = ctx.chat_id
-        if chat_id in self._busy:
-            await self.tg.send_message(chat_id, "Still working on your previous message, one moment.")
+        if ctx.key in self._busy:
+            await self.reply(ctx, "Still working on your previous message, one moment.")
             return
-        name = self.backend_name(chat_id)
+        name = self.backend_name(*ctx.key)
         if not self.s.backend_allowed(ctx.role, name):
-            await self.tg.send_message(chat_id, f"Your role ({ctx.role}) can't use the {name} backend. "
+            await self.reply(ctx, f"Your role ({ctx.role}) can't use the {name} backend. "
                                                 "Pick another with /backend.")
             return
-        self._busy[chat_id] = name
-        turn = Turn(chat_id=chat_id, session_id=self.store.session_id(chat_id), text=text,
-                    history=self.store.history(chat_id, self.s.history_limit), images=images)
+        self._busy[ctx.key] = name
+        turn = Turn(chat_id=ctx.chat_id, session_id=self.store.session_id(*ctx.key), text=text,
+                    history=self.store.history(ctx.chat_id, self.s.history_limit, ctx.thread_id), images=images,
+                    thread_id=ctx.thread_id)
         self.spawn(self._run_turn(name, turn))
 
-    def backend_name(self, chat_id: int) -> str:
-        name = self.store.backend_for(chat_id)
+    def backend_name(self, chat_id: int, thread: int = 0) -> str:
+        name = self.store.backend_for(chat_id, thread)
         return name if name in self.backends else self.s.default_backend
 
     async def _run_turn(self, name: str, turn: Turn) -> None:
         try:
             await self._stream_turn(name, turn)
         finally:
-            self._busy.pop(turn.chat_id, None)
+            self._busy.pop((turn.chat_id, turn.thread_id), None)
 
     async def _stream_turn(self, name: str, turn: Turn) -> None:
         chat_id = turn.chat_id
         backend = self.backends[name]
-        await self.tg.send_chat_action(chat_id)
-        placeholder = await self.tg.send_message(chat_id, "…")
+        await self.tg.send_chat_action(chat_id, thread_id=turn.thread_id)
+        placeholder = await self.tg.send_message(chat_id, "…", thread_id=turn.thread_id)
         mid = placeholder["message_id"]
         text, status, last_edit, shown = "", "", 0.0, "…"
         try:
@@ -242,13 +253,13 @@ class Bot:
             await self._safe_edit(chat_id, mid, "⚠️ Internal error, see bot logs.")
             return
         text = text.strip() or "(empty reply)"
-        self.store.add_message(chat_id, "user", turn.text)
-        self.store.add_message(chat_id, "assistant", text)
-        await self._deliver(chat_id, mid, text)
+        self.store.add_message(chat_id, "user", turn.text, turn.thread_id)
+        self.store.add_message(chat_id, "assistant", text, turn.thread_id)
+        await self._deliver(chat_id, mid, text, turn.thread_id)
 
     async def _on_backend_event(self, name: str, turn: Turn, ev) -> None:
         if isinstance(ev, ApprovalRequest):
-            await self.ask_approval(turn.chat_id, name, ev)
+            await self.ask_approval(turn.chat_id, name, ev, turn.thread_id)
         else:
             log.info("ignoring unsupported backend event %r", ev)
 
@@ -262,21 +273,21 @@ class Bot:
         """
         chats = [c for c, n in self._busy.items() if n == name]
         if chats:
-            chat_id = chats[-1]
+            chat_id, thread = chats[-1]
         elif self.s.owners:
-            chat_id = min(self.s.owners)
+            chat_id, thread = min(self.s.owners), 0
         else:
             log.warning("approval %s from %s dropped: nobody is allowlisted", req.ref, name)
             return
-        await self.ask_approval(chat_id, name, req)
+        await self.ask_approval(chat_id, name, req, thread)
 
-    async def ask_approval(self, chat_id: int, name: str, req: ApprovalRequest) -> None:
+    async def ask_approval(self, chat_id: int, name: str, req: ApprovalRequest, thread: int = 0) -> None:
         tid = self.store.create_task(chat_id, name, req.ref, req.summary)
         self.store.audit("request", chat_id=chat_id, task_id=tid, detail=f"{name}: {req.summary[:500]}")
         text = f"🔐 Approval needed (task #{tid}, {name}):\n\n{req.summary[:3500]}"
         keyboard = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"ap:{tid}:1"},
                                          {"text": "❌ Deny", "callback_data": f"ap:{tid}:0"}]]}
-        msg = await self.tg.send_message(chat_id, text, reply_markup=keyboard)
+        msg = await self.tg.send_message(chat_id, text, reply_markup=keyboard, thread_id=thread)
         self._prompts[tid] = (chat_id, msg["message_id"], text)
         self._timers[tid] = asyncio.create_task(self._expire(tid, chat_id, msg["message_id"], text))
 
@@ -358,7 +369,7 @@ class Bot:
         except TelegramError as e:
             log.warning("edit failed: %s", e)
 
-    async def _deliver(self, chat_id: int, mid: int, md: str) -> None:
+    async def _deliver(self, chat_id: int, mid: int, md: str, thread: int = 0) -> None:
         """Replace the placeholder with the formatted reply, splitting as needed."""
         try:
             chunks, mode = render(md), "HTML"
@@ -369,64 +380,60 @@ class Bot:
             await self.tg.edit_message(chat_id, mid, chunks[0])
         for chunk in chunks[1:]:
             try:
-                await self.tg.send_message(chat_id, chunk, parse_mode=mode)
+                await self.tg.send_message(chat_id, chunk, parse_mode=mode, thread_id=thread)
             except TelegramError:
                 for part in split_plain(chunk):
-                    await self.tg.send_message(chat_id, part)
+                    await self.tg.send_message(chat_id, part, thread_id=thread)
 
     # ---- commands -----------------------------------------------------------------
 
     async def _command(self, ctx: Ctx, cmd: str, arg: str) -> None:
         handler = getattr(self, f"cmd_{cmd}", None)
         if handler is None:
-            await self.tg.send_message(ctx.chat_id, f"Unknown command /{cmd}. Try /help.")
+            await self.reply(ctx, f"Unknown command /{cmd}. Try /help.")
             return
         await handler(ctx, arg)
 
     async def cmd_start(self, ctx: Ctx, arg: str) -> None:
-        chat_id = ctx.chat_id
-        text = (f"Hi! I'm your personal assistant, backed by <b>{self.backend_name(chat_id)}</b>. "
+        text = (f"Hi! I'm your personal assistant, backed by <b>{self.backend_name(*ctx.key)}</b>. "
                 "Just send a message. /help lists commands.")
-        await self.tg.send_message(chat_id, text, parse_mode="HTML")
+        await self.reply(ctx, text, parse_mode="HTML")
 
     async def cmd_help(self, ctx: Ctx, arg: str) -> None:
-        chat_id = ctx.chat_id
         lines = [f"/{c} - {d}" for c, d in COMMANDS]
         lines += ["", "Send text, photos or documents. Side-effecting agent actions ask for approval first."]
-        await self.tg.send_message(chat_id, "\n".join(lines))
+        await self.reply(ctx, "\n".join(lines))
 
     async def cmd_reset(self, ctx: Ctx, arg: str) -> None:
-        chat_id = ctx.chat_id
-        self.store.reset(chat_id)
-        await self.tg.send_message(chat_id, "Conversation cleared. New session started.")
+        self.store.reset(*ctx.key)
+        await self.reply(ctx, "Conversation cleared. New session started.")
 
     async def cmd_backend(self, ctx: Ctx, arg: str) -> None:
         chat_id = ctx.chat_id
-        current = self.backend_name(chat_id)
+        current = self.backend_name(*ctx.key)
         usable = [n for n in self.backends if self.s.backend_allowed(ctx.role, n)]
         if not arg:
             lines = [("• " if n == current else "  ") + n for n in usable]
-            await self.tg.send_message(chat_id, "Backends (• = active):\n" + "\n".join(lines)
+            await self.reply(ctx, "Backends (• = active):\n" + "\n".join(lines)
                                        + "\n\nSwitch with /backend <name>.")
             return
         if arg not in usable:
-            await self.tg.send_message(chat_id, f"Unknown backend {arg!r}. Available: {', '.join(usable)}")
+            await self.reply(ctx, f"Unknown backend {arg!r}. Available: {', '.join(usable)}")
             return
-        self.store.set_backend(chat_id, arg)
-        await self.tg.send_message(chat_id, f"Switched to {arg}.")
+        self.store.set_backend(chat_id, arg, ctx.thread_id)
+        await self.reply(ctx, f"Switched to {arg}.")
 
     async def cmd_status(self, ctx: Ctx, arg: str) -> None:
-        chat_id = ctx.chat_id
-        name = self.backend_name(chat_id)
+        name = self.backend_name(*ctx.key)
         try:
             health = await asyncio.wait_for(self.backends[name].health(), timeout=8)
         except asyncio.TimeoutError:
             health = "timeout"
         up = int(time.time() - self.started)
-        await self.tg.send_message(chat_id, "\n".join([
+        await self.reply(ctx, "\n".join([
             f"backend: {name} ({health})",
-            f"session: {self.store.session_id(chat_id)}",
-            f"messages stored: {self.store.count_messages(chat_id)}",
+            f"session: {self.store.session_id(*ctx.key)}",
+            f"messages stored: {self.store.count_messages(*ctx.key)}",
             f"uptime: {up // 3600}h{up % 3600 // 60:02d}m",
         ]))
 
@@ -434,10 +441,10 @@ class Bot:
         chat_id = ctx.chat_id
         tasks = self.store.list_tasks(chat_id)
         if not tasks:
-            await self.tg.send_message(chat_id, "No agent tasks yet.")
+            await self.reply(ctx, "No agent tasks yet.")
             return
         lines = [f"#{t.id} [{t.status}] {t.backend}: {t.summary.splitlines()[0][:80]}" for t in tasks]
-        await self.tg.send_message(chat_id, "\n".join(lines))
+        await self.reply(ctx, "\n".join(lines))
 
     def _at_least(self, ctx: Ctx, role: str) -> bool:
         return ROLES.index(ctx.role) <= ROLES.index(role)
@@ -445,7 +452,7 @@ class Bot:
     async def cmd_users(self, ctx: Ctx, arg: str) -> None:
         chat_id = ctx.chat_id
         if not self._at_least(ctx, "admin"):
-            await self.tg.send_message(chat_id, "Only admins can manage users.")
+            await self.reply(ctx, "Only admins can manage users.")
             return
         action, *rest = arg.split() or ["list"]
         if action == "list":
@@ -457,50 +464,50 @@ class Bot:
             text = "From environment:\n" + ("\n".join(env) or "(none)")
             text += "\n\nAdded with /users:\n" + ("\n".join(added) or "(none)")
             text += "\n\n/users add <id> [user|admin] · /users remove <id>"
-            await self.tg.send_message(chat_id, text)
+            await self.reply(ctx, text)
             return
         if action not in {"add", "remove"} or not rest or not rest[0].lstrip("-").isdigit():
-            await self.tg.send_message(chat_id, "Usage: /users [list] | add <id> [user|admin] | remove <id>")
+            await self.reply(ctx, "Usage: /users [list] | add <id> [user|admin] | remove <id>")
             return
         uid = int(rest[0])
         if self.s.env_role(uid):
-            await self.tg.send_message(chat_id, f"{uid} is set in the environment ({self.s.env_role(uid)}); "
+            await self.reply(ctx, f"{uid} is set in the environment ({self.s.env_role(uid)}); "
                                                 "change it there.")
             return
         if action == "add":
             role = rest[1] if len(rest) > 1 else "user"
             if role not in {"user", "admin"}:
-                await self.tg.send_message(chat_id, "Role must be user or admin.")
+                await self.reply(ctx, "Role must be user or admin.")
                 return
             if role == "admin" and ctx.role != "owner":
-                await self.tg.send_message(chat_id, "Only owners can add admins.")
+                await self.reply(ctx, "Only owners can add admins.")
                 return
             if self.store.user_role(uid) == "admin" and ctx.role != "owner":
-                await self.tg.send_message(chat_id, "Only owners can change an admin.")
+                await self.reply(ctx, "Only owners can change an admin.")
                 return
             self.store.set_user(uid, role, ctx.user_id)
             self.store.audit("user.add", user_id=ctx.user_id, chat_id=chat_id, detail=f"{uid} as {role}")
-            await self.tg.send_message(chat_id, f"Added {uid} as {role}.")
+            await self.reply(ctx, f"Added {uid} as {role}.")
             return
         current = self.store.user_role(uid)
         if current is None:
-            await self.tg.send_message(chat_id, f"{uid} is not a runtime user.")
+            await self.reply(ctx, f"{uid} is not a runtime user.")
             return
         if current == "admin" and ctx.role != "owner":
-            await self.tg.send_message(chat_id, "Only owners can remove admins.")
+            await self.reply(ctx, "Only owners can remove admins.")
             return
         self.store.remove_user(uid)
         self.store.audit("user.remove", user_id=ctx.user_id, chat_id=chat_id, detail=f"{uid} ({current})")
-        await self.tg.send_message(chat_id, f"Removed {uid}.")
+        await self.reply(ctx, f"Removed {uid}.")
 
     async def cmd_audit(self, ctx: Ctx, arg: str) -> None:
         if not self._at_least(ctx, "admin"):
-            await self.tg.send_message(ctx.chat_id, "Only admins can read the audit log.")
+            await self.reply(ctx, "Only admins can read the audit log.")
             return
         limit = min(int(arg), 100) if arg.isdigit() and int(arg) > 0 else 20
         entries = self.store.audit_log(limit)
         if not entries:
-            await self.tg.send_message(ctx.chat_id, "Audit log is empty.")
+            await self.reply(ctx, "Audit log is empty.")
             return
         lines = []
         for e in reversed(entries):
@@ -511,7 +518,7 @@ class Bot:
             lines.append(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.ts))} {e.action} by {who}{where}"
                          + (f": {first}" if first else ""))
         for chunk in split_plain("\n".join(lines)):
-            await self.tg.send_message(ctx.chat_id, chunk)
+            await self.reply(ctx, chunk)
 
     # ---- schedules --------------------------------------------------------------
 
@@ -520,7 +527,7 @@ class Bot:
 
     async def _schedule_quota_ok(self, ctx: Ctx) -> bool:
         if ctx.role != "owner" and self.store.count_schedules(ctx.user_id) >= self.s.max_schedules_per_user:
-            await self.tg.send_message(ctx.chat_id, f"You already have {self.s.max_schedules_per_user} schedules. "
+            await self.reply(ctx, f"You already have {self.s.max_schedules_per_user} schedules. "
                                                     "Remove one with /unschedule.")
             return False
         return True
@@ -528,62 +535,64 @@ class Bot:
     async def cmd_remind(self, ctx: Ctx, arg: str) -> None:
         when, _, text = arg.partition(" ")
         if not text.strip():
-            await self.tg.send_message(ctx.chat_id, "Usage: /remind <10m|2h30m|14:30|2026-10-01T09:00> <text>")
+            await self.reply(ctx, "Usage: /remind <10m|2h30m|14:30|2026-10-01T09:00> <text>")
             return
         try:
             at = parse_when(when, datetime.now(self.tz))
         except ValueError as e:
-            await self.tg.send_message(ctx.chat_id, str(e))
+            await self.reply(ctx, str(e))
             return
         if not await self._schedule_quota_ok(ctx):
             return
-        sid = self.store.add_schedule(ctx.chat_id, ctx.user_id, "remind", when, text.strip(), at.timestamp())
+        sid = self.store.add_schedule(ctx.chat_id, ctx.user_id, "remind", when, text.strip(), at.timestamp(),
+                                      ctx.thread_id)
         self._sched_wake.set()
-        await self.tg.send_message(ctx.chat_id, f"⏰ Reminder #{sid} set for {self._fmt(at.timestamp())}.")
+        await self.reply(ctx, f"⏰ Reminder #{sid} set for {self._fmt(at.timestamp())}.")
 
     async def cmd_every(self, ctx: Ctx, arg: str) -> None:
         spec, prompt = split_spec(arg)
         if not prompt.strip():
-            await self.tg.send_message(ctx.chat_id, "Usage: /every <cron: m h dom mon dow | @daily | 2h> <prompt>\n"
+            await self.reply(ctx, "Usage: /every <cron: m h dom mon dow | @daily | 2h> <prompt>\n"
                                                     "e.g. /every 0 9 * * 1-5 Summarise my calendar")
             return
         try:
             first = next_run(spec, datetime.now(self.tz))
         except ValueError as e:
-            await self.tg.send_message(ctx.chat_id, f"Bad schedule: {e}")
+            await self.reply(ctx, f"Bad schedule: {e}")
             return
-        name = self.backend_name(ctx.chat_id)
+        name = self.backend_name(*ctx.key)
         if not self.s.backend_allowed(ctx.role, name):
-            await self.tg.send_message(ctx.chat_id, f"Your role ({ctx.role}) can't use the {name} backend.")
+            await self.reply(ctx, f"Your role ({ctx.role}) can't use the {name} backend.")
             return
         if not await self._schedule_quota_ok(ctx):
             return
-        sid = self.store.add_schedule(ctx.chat_id, ctx.user_id, "every", spec, prompt.strip(), first.timestamp())
+        sid = self.store.add_schedule(ctx.chat_id, ctx.user_id, "every", spec, prompt.strip(), first.timestamp(),
+                                      ctx.thread_id)
         self._sched_wake.set()
-        await self.tg.send_message(ctx.chat_id, f"🔁 #{sid} runs `{spec}` on this chat's backend. "
+        await self.reply(ctx, f"🔁 #{sid} runs `{spec}` on this chat's backend. "
                                                 f"Next: {self._fmt(first.timestamp())}.")
 
     async def cmd_schedules(self, ctx: Ctx, arg: str) -> None:
         items = self.store.list_schedules(ctx.chat_id)
         if not items:
-            await self.tg.send_message(ctx.chat_id, "Nothing scheduled. See /remind and /every.")
+            await self.reply(ctx, "Nothing scheduled. See /remind and /every.")
             return
         lines = [f"{'⏰' if sc.kind == 'remind' else '🔁'} #{sc.id} "
                  + (f"at {self._fmt(sc.next_run)}" if sc.kind == "remind"
                     else f"{sc.spec}, next {self._fmt(sc.next_run)}, ran {sc.runs}x")
                  + f": {sc.text[:80]}" for sc in items]
-        await self.tg.send_message(ctx.chat_id, "\n".join(lines) + "\n\nCancel with /unschedule <id>.")
+        await self.reply(ctx, "\n".join(lines) + "\n\nCancel with /unschedule <id>.")
 
     async def cmd_unschedule(self, ctx: Ctx, arg: str) -> None:
         sc = self.store.get_schedule(int(arg.lstrip("#"))) if arg.lstrip("#").isdigit() else None
         if sc is None or sc.chat_id != ctx.chat_id:
-            await self.tg.send_message(ctx.chat_id, "No such schedule in this chat. See /schedules.")
+            await self.reply(ctx, "No such schedule in this chat. See /schedules.")
             return
         if sc.user_id != ctx.user_id and not self._at_least(ctx, "admin"):
-            await self.tg.send_message(ctx.chat_id, "Only its creator or an admin can cancel it.")
+            await self.reply(ctx, "Only its creator or an admin can cancel it.")
             return
         self.store.delete_schedule(sc.id)
-        await self.tg.send_message(ctx.chat_id, f"Cancelled #{sc.id}.")
+        await self.reply(ctx, f"Cancelled #{sc.id}.")
 
     async def scheduler(self) -> None:
         """Fire due schedules forever. Missed runs (bot was down) fire once, late."""
@@ -605,6 +614,7 @@ class Bot:
         for sc in self.store.due_schedules(now):
             late = now - sc.next_run > 120
             role = self.role_of({"id": sc.user_id})
+            ctx = Ctx(sc.chat_id, sc.user_id, role or "", {}, sc.thread_id)
             if role is None:  # creator lost access
                 self.store.delete_schedule(sc.id)
                 log.info("dropped schedule %s: user %s no longer allowed", sc.id, sc.user_id)
@@ -612,17 +622,17 @@ class Bot:
             if sc.kind == "remind":
                 self.store.delete_schedule(sc.id)
                 note = " (late: the bot was offline)" if late else ""
-                await self.tg.send_message(sc.chat_id, f"⏰ Reminder{note}: {sc.text}")
+                await self.reply(ctx, f"⏰ Reminder{note}: {sc.text}")
                 continue
-            if sc.chat_id in self._busy:  # try again shortly without counting a run
+            if ctx.key in self._busy:  # try again shortly without counting a run
                 self.store.reschedule(sc.id, now + 15, ran=False)
                 continue
             try:
                 nxt = next_run(sc.spec, datetime.now(self.tz)).timestamp()
             except ValueError as e:
                 self.store.delete_schedule(sc.id)
-                await self.tg.send_message(sc.chat_id, f"Removed schedule #{sc.id}: {e}")
+                await self.reply(ctx, f"Removed schedule #{sc.id}: {e}")
                 continue
             self.store.reschedule(sc.id, nxt)  # before running, so a crash can't replay it
-            await self.tg.send_message(sc.chat_id, f"🔁 #{sc.id}: {sc.text[:300]}")
-            await self._start_turn(Ctx(sc.chat_id, sc.user_id, role, {}), sc.text, [])
+            await self.reply(ctx, f"🔁 #{sc.id}: {sc.text[:300]}")
+            await self._start_turn(ctx, sc.text, [])
