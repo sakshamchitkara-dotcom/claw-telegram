@@ -142,6 +142,22 @@ class Bot:
     async def init(self) -> None:
         """Learn our own id and @username (needed to spot mentions and replies in groups)."""
         self.me = await self.tg.get_me()
+        await self._deny_orphaned_approvals()
+
+    async def _deny_orphaned_approvals(self) -> None:
+        """Approvals still pending from before a crash have no timer and no live prompt: deny them.
+
+        Their buttons then answer "Already resolved." instead of approving something nobody is watching.
+        """
+        for task in self.store.pending_tasks():
+            if not self.store.resolve_task(task.id, "expired"):
+                continue
+            self.store.audit("expire", chat_id=task.chat_id, task_id=task.id, detail="pending when the bot restarted")
+            try:
+                await self.backends[task.backend].resolve_approval(task.ref, False)
+            except (BackendError, KeyError) as e:  # usually gone with the old process anyway
+                log.info("orphaned approval %s: backend did not take the deny: %s", task.id, e)
+            log.warning("denied approval #%s left pending by a previous run", task.id)
 
     # ---- entry point ----------------------------------------------------------
 

@@ -216,6 +216,11 @@ class Store:
                               "WHERE backend = ? AND ref = ? AND status = 'pending'", (backend, ref)).fetchone()
         return Task(*row) if row else None
 
+    def pending_tasks(self) -> list[Task]:
+        rows = self.db.execute("SELECT id, chat_id, backend, ref, summary, status, created FROM tasks "
+                               "WHERE status = 'pending' ORDER BY id").fetchall()
+        return [Task(*r) for r in rows]
+
     def resolve_task(self, task_id: int, status: str) -> bool:
         """Move a pending task to a final status. Returns False if it was already resolved."""
         cur = self.db.execute("UPDATE tasks SET status = ?, resolved = ? WHERE id = ? AND status = 'pending'",

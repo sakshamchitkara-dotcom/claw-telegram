@@ -66,3 +66,23 @@ async def test_shutdown_marks_interrupted_replies_and_denies_open_approvals():
         assert prompt["text"].endswith("⌛ The bot restarted: denied.") and "reply_markup" not in prompt
         assert h.bot.store.get_task(1).status == "expired"
         assert not h.bot._tasks
+
+
+async def test_approvals_left_pending_by_a_crash_are_denied_at_startup():
+    async with harness() as h:
+        h.fake.push_message(OWNER, "!task rm -rf /srv")
+        await h.pump(drain=False)
+        await asyncio.sleep(0.05)
+        prompt = h.fake.with_keyboard(OWNER)[0]
+        store = h.bot.store
+    # "restart": a new bot on the same database, without a clean shutdown
+    async with harness() as h2:
+        h2.bot.store = store
+        await h2.bot.init()
+        assert store.get_task(1).status == "expired"
+        assert store.audit_log(1)[0].detail == "pending when the bot restarted"
+        h2.fake.messages[(OWNER, prompt["message_id"])] = prompt
+        h2.fake.push_callback(OWNER, prompt, "ap:1:1")
+        await h2.pump()
+        answers = [p["text"] for m, p in h2.fake.calls if m == "answerCallbackQuery"]
+        assert answers == ["Already resolved."]
