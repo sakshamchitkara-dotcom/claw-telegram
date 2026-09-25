@@ -3,6 +3,15 @@
 All notable changes to this project. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-09-25
+
+### Fixed
+
+- After an approval prompt was answered, the backend got whatever was left of the current idle window (anywhere
+  from zero to `IDLE_TIMEOUT_S`) before being declared stalled, so a backend resuming right after Approve could
+  fail at once. It now gets a full window. The `v0.3.0` tag points at a commit whose CI run failed on
+  Python 3.13 because of this; use 0.3.1.
+
 ## [0.3.0] - 2026-09-25
 
 ### Added
@@ -91,6 +100,7 @@ Streaming replies, Approve/Deny for agent actions (OpenClaw exec approvals over 
 run approvals), photos/documents/voice notes, per-chat sqlite memory, allowlist auth, rate limiting, polling
 and webhook modes, Docker and systemd deployment.
 
+[0.3.1]: https://github.com/sakshamchitkara-dotcom/claw-telegram/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sakshamchitkara-dotcom/claw-telegram/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sakshamchitkara-dotcom/claw-telegram/compare/52eef20...v0.2.0
 [0.1.0]: https://github.com/sakshamchitkara-dotcom/claw-telegram/tree/52eef20
