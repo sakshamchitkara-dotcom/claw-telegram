@@ -37,3 +37,22 @@ def test_tasks_resolve_once():
     assert not s.resolve_task(tid, "denied")
     assert s.get_task(tid).status == "approved"
     assert [t.id for t in s.list_tasks(1)] == [tid]
+
+
+def test_users_upsert_and_remove():
+    s = Store(":memory:")
+    assert s.user_role(5) is None
+    s.set_user(5, "user", added_by=1)
+    s.set_user(5, "admin", added_by=1)
+    assert s.user_role(5) == "admin" and s.list_users() == [(5, "admin", 1)]
+    assert s.remove_user(5) and not s.remove_user(5)
+
+
+def test_audit_log_newest_first_and_per_chat():
+    s = Store(":memory:")
+    s.audit("approve", user_id=1, chat_id=10, task_id=3, detail="rm -rf x")
+    s.audit("user.add", user_id=1, detail="5 as user")
+    s.audit("deny", user_id=2, chat_id=11, task_id=4)
+    assert [e.action for e in s.audit_log()] == ["deny", "user.add", "approve"]
+    only = s.audit_log(chat_id=10)
+    assert len(only) == 1 and only[0].task_id == 3 and only[0].detail == "rm -rf x"

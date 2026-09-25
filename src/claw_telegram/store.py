@@ -32,6 +32,21 @@ CREATE TABLE IF NOT EXISTS tasks (
     resolved REAL
 );
 CREATE INDEX IF NOT EXISTS tasks_chat ON tasks (chat_id, id);
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+    added_by INTEGER,
+    created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    user_id INTEGER,
+    chat_id INTEGER,
+    action TEXT NOT NULL,
+    task_id INTEGER,
+    detail TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -44,6 +59,17 @@ class Task:
     summary: str
     status: str
     created: float
+
+
+@dataclass
+class AuditEntry:
+    id: int
+    ts: float
+    user_id: int | None
+    chat_id: int | None
+    action: str
+    task_id: int | None
+    detail: str
 
 
 class Store:
@@ -119,3 +145,33 @@ class Store:
         rows = self.db.execute("SELECT id, chat_id, backend, ref, summary, status, created FROM tasks "
                                "WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (chat_id, limit)).fetchall()
         return [Task(*r) for r in rows]
+
+    # ---- runtime-managed users (env roles take precedence) -----------------
+
+    def user_role(self, user_id: int) -> str | None:
+        row = self.db.execute("SELECT role FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return row[0] if row else None
+
+    def set_user(self, user_id: int, role: str, added_by: int) -> None:
+        self.db.execute("INSERT INTO users (user_id, role, added_by, created) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET role = excluded.role, added_by = excluded.added_by",
+                        (user_id, role, added_by, time.time()))
+
+    def remove_user(self, user_id: int) -> bool:
+        return self.db.execute("DELETE FROM users WHERE user_id = ?", (user_id,)).rowcount == 1
+
+    def list_users(self) -> list[tuple[int, str, int | None]]:
+        return self.db.execute("SELECT user_id, role, added_by FROM users ORDER BY role, user_id").fetchall()
+
+    # ---- append-only audit log ------------------------------------------------
+
+    def audit(self, action: str, user_id: int | None = None, chat_id: int | None = None,
+              task_id: int | None = None, detail: str = "") -> None:
+        self.db.execute("INSERT INTO audit (ts, user_id, chat_id, action, task_id, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                        (time.time(), user_id, chat_id, action, task_id, detail))
+
+    def audit_log(self, limit: int = 20, chat_id: int | None = None) -> list[AuditEntry]:
+        where, args = ("WHERE chat_id = ?", (chat_id,)) if chat_id is not None else ("", ())
+        rows = self.db.execute(f"SELECT id, ts, user_id, chat_id, action, task_id, detail FROM audit {where} "
+                               "ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
+        return [AuditEntry(*r) for r in rows]
