@@ -15,6 +15,8 @@ Confirmed from the Hermes Agent docs / source (gateway/platforms/api_server*.py)
 
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 
 from .base import ApprovalRequest, BackendError, Event, Status, Turn, error_text
@@ -64,6 +66,6 @@ class HermesBackend(OpenAICompatBackend):
         try:
             async with self.session.get(f"{self.root}/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 live = "live" if resp.status == 200 else f"HTTP {resp.status}"
-        except (aiohttp.ClientError, TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             return f"unreachable ({e.__class__.__name__})"
         return f"{live}; models: {await super().health()}"

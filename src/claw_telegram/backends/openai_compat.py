@@ -7,6 +7,7 @@ the request body and how their extra SSE event types are interpreted.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -102,6 +103,8 @@ class OpenAICompatBackend(Backend):
                             name = (call.get("function") or {}).get("name")
                             if name:
                                 yield Status(f"tool call: {name}")
+        except asyncio.TimeoutError as e:
+            raise BackendError(f"{self.name}: timed out waiting for {self.base_url}") from e
         except aiohttp.ClientError as e:
             raise BackendError(f"{self.name}: cannot reach {self.base_url} ({e.__class__.__name__}: {e})") from e
 
@@ -114,7 +117,7 @@ class OpenAICompatBackend(Backend):
                 data = await resp.json(content_type=None)
                 ids = [m.get("id") for m in data.get("data", [])]
                 return f"ok ({len(ids)} models{', ' + self.model + ' present' if self.model in ids else ''})"
-        except (aiohttp.ClientError, TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             return f"unreachable ({e.__class__.__name__})"
 
     async def close(self) -> None:
