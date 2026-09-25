@@ -26,6 +26,7 @@ COMMANDS = [
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
     ("users", "Admins: list, add or remove users"),
+    ("audit", "Admins: approval and user-change log"),
 ]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TEXT_DOC_BYTES = 200 * 1024
@@ -481,3 +482,23 @@ class Bot:
         self.store.remove_user(uid)
         self.store.audit("user.remove", user_id=ctx.user_id, chat_id=chat_id, detail=f"{uid} ({current})")
         await self.tg.send_message(chat_id, f"Removed {uid}.")
+
+    async def cmd_audit(self, ctx: Ctx, arg: str) -> None:
+        if not self._at_least(ctx, "admin"):
+            await self.tg.send_message(ctx.chat_id, "Only admins can read the audit log.")
+            return
+        limit = min(int(arg), 100) if arg.isdigit() and int(arg) > 0 else 20
+        entries = self.store.audit_log(limit)
+        if not entries:
+            await self.tg.send_message(ctx.chat_id, "Audit log is empty.")
+            return
+        lines = []
+        for e in reversed(entries):
+            who = f"user {e.user_id}" if e.user_id is not None else "system"
+            where = f" task #{e.task_id}" if e.task_id else ""
+            where += f" chat {e.chat_id}" if e.chat_id is not None else ""
+            first = e.detail.splitlines()[0][:120] if e.detail else ""
+            lines.append(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.ts))} {e.action} by {who}{where}"
+                         + (f": {first}" if first else ""))
+        for chunk in split_plain("\n".join(lines)):
+            await self.tg.send_message(ctx.chat_id, chunk)

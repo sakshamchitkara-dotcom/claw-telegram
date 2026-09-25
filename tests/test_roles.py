@@ -86,3 +86,20 @@ async def test_users_command_permissions_and_audit():
         assert f"owner: {OWNER}" in listing and f"admin: {ADMIN}" in listing and "6000 (admin, added by" in listing
         assert "5000" not in listing
         assert [e.action for e in h.bot.store.audit_log()] == ["user.remove", "user.add", "user.add"]
+
+
+async def test_audit_command():
+    async with harness(**roles()) as h:
+        prompt = await start_task(h)
+        h.fake.push_callback(OWNER, prompt, "ap:1:0")
+        await h.pump()
+        for uid, text in [(USER, "/audit"), (ADMIN, "/audit"), (ADMIN, "/audit 1")]:
+            h.fake.push_message(uid, text)
+            await h.pump()
+        assert h.fake.texts(USER)[-1] == "Only admins can read the audit log."
+        full, last = h.fake.texts(ADMIN)
+        lines = full.splitlines()
+        assert len(lines) == 2
+        assert " request by system task #1 chat 1001: echo: run shell: rm -rf /tmp/demo" in lines[0]
+        assert f" deny by user {OWNER} task #1 chat 1001: run shell: rm -rf /tmp/demo" in lines[1]
+        assert last == lines[1]
