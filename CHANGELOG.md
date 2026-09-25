@@ -3,6 +3,14 @@
 All notable changes to this project. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `GET /metrics` in Prometheus text format: turns by outcome with durations, replies and failures per backend,
+  approvals requested and resolved, running turns, pending approvals, backend health and circuit state.
+  Behind the `ADMIN_PASSWORD` Basic auth when that is set.
+
 ## [0.3.1] - 2026-09-25
 
 ### Fixed

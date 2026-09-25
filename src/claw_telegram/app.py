@@ -1,4 +1,4 @@
-"""Process wiring: long polling or webhook, plus /healthz and the optional /admin page."""
+"""Process wiring: long polling or webhook, plus /healthz, /metrics and the optional /admin page."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from datetime import datetime
 
 from aiohttp import web
 
+from . import __version__
 from .backends import build_backends
 from .bot import COMMANDS, Bot
 from .config import Settings
@@ -94,6 +95,50 @@ margin-bottom:20px}}td,th{{border-bottom:1px solid #ccc;padding:4px 8px;text-ali
 {audit}</table></body></html>"""
 
 
+METRIC_HELP = {  # name -> (type, help); counters the bot keeps in Bot.metrics
+    "turns_total": ("counter", "Agent turns by outcome (ok, fallback, failed, error, cancelled)"),
+    "turn_seconds": ("summary", "Wall time of agent turns, placeholder to final reply"),
+    "backend_replies_total": ("counter", "Turns answered, by the backend that answered"),
+    "backend_failures_total": ("counter", "Backend attempts that failed (errors and timeouts)"),
+    "approvals_requested_total": ("counter", "Approval prompts shown, by backend"),
+    "approvals_total": ("counter", "Approvals resolved, by outcome"),
+}
+
+
+def _labels(pairs) -> str:
+    def esc(v) -> str:
+        return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return "{" + ",".join(f'{k}="{esc(v)}"' for k, v in pairs) + "}" if pairs else ""
+
+
+def metrics_text(bot: Bot, stats: dict) -> str:
+    """Prometheus text exposition format (version 0.0.4)."""
+    out: list[str] = []
+
+    def family(name: str, kind: str, help_: str, samples) -> None:
+        out.append(f"# HELP claw_{name} {help_}\n# TYPE claw_{name} {kind}")
+        out.extend(f"claw_{suffix}{_labels(labels)} {round(value, 6)}" for suffix, labels, value in samples)
+
+    for name, (kind, help_) in METRIC_HELP.items():
+        suffixes = (f"{name}_sum", f"{name}_count") if kind == "summary" else (name,)
+        family(name, kind, help_, sorted((n, labels, v) for (n, labels), v in bot.metrics.items() if n in suffixes))
+    family("info", "gauge", "Build information", [("info", [("version", __version__)], 1)])
+    family("uptime_seconds", "gauge", "Seconds since the bot started",
+           [("uptime_seconds", [], round(time.time() - bot.started))])
+    family("updates_total", "counter", "Telegram updates received", [("updates_total", [], stats["updates"])])
+    family("webhook_duplicates_total", "counter", "Redelivered webhook updates dropped",
+           [("webhook_duplicates_total", [], stats["duplicates"])])
+    family("turns_running", "gauge", "Agent turns in progress", [("turns_running", [], len(bot._turns))])
+    family("approvals_pending", "gauge", "Approval prompts waiting for an answer",
+           [("approvals_pending", [], len(bot.store.pending_tasks()))])
+    family("backend_up", "gauge", "1 if the latest health probe passed, 0 if it failed (absent: not probed yet)",
+           [("backend_up", [("backend", n)], int(healthy(st))) for n, st in sorted(bot.health.status.items())])
+    family("circuit_state", "gauge", "Circuit breaker state per backend (1 = current state)",
+           [("circuit_state", [("backend", n), ("state", st)], int(b.state == st))
+            for n, b in sorted(bot.health.breakers.items()) for st in ("closed", "half-open", "open")])
+    return "\n".join(out) + "\n"
+
+
 def make_web_app(bot: Bot, settings: Settings) -> web.Application:
     app = web.Application(client_max_size=4 * 1024 * 1024)
     stats = {"updates": 0, "last_update": None, "duplicates": 0}
@@ -134,6 +179,13 @@ def make_web_app(bot: Bot, settings: Settings) -> web.Application:
         bot.submit(update)  # ack fast; Telegram retries slow webhooks
         return web.Response(text="ok")
 
+    async def metrics(request: web.Request) -> web.Response:
+        if settings.admin_password and not basic_auth_ok(request.headers.get("Authorization", ""),
+                                                          settings.admin_password):
+            return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="claw-telegram"'})
+        return web.Response(text=metrics_text(bot, stats), content_type="text/plain",
+                            headers={"Cache-Control": "no-store"}, charset="utf-8")
+
     async def admin(request: web.Request) -> web.Response:
         if not basic_auth_ok(request.headers.get("Authorization", ""), settings.admin_password):
             log.warning("admin page: bad or missing credentials from %s", request.remote)
@@ -143,6 +195,7 @@ def make_web_app(bot: Bot, settings: Settings) -> web.Application:
                                      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
 
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/metrics", metrics)
     if settings.admin_password:
         app.router.add_get("/admin", admin)
     if settings.mode == "webhook":

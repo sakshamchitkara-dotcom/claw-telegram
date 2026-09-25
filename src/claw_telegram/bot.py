@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -139,11 +140,16 @@ class Bot:
         self._chat_tail: dict[int, asyncio.Task] = {}  # chat -> its newest queued update
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
         self._prompts: dict[int, tuple[int, int, str]] = {}  # task id -> (chat, message id, text)
+        self.metrics: collections.Counter = collections.Counter()  # (name, sorted label pairs) -> value
         for name, backend in backends.items():
             if hasattr(backend, "approval_sink"):  # backends that raise approvals out of band
                 backend.approval_sink = lambda req, name=name: self._external_approval(name, req)
             if hasattr(backend, "resolved_sink"):  # ...and can report approvals answered elsewhere
                 backend.resolved_sink = lambda ref, decision, name=name: self._resolved_elsewhere(name, ref, decision)
+
+    def count(self, name: str, value: float = 1, **labels: str) -> None:
+        """Add to a counter exported at /metrics."""
+        self.metrics[(name, tuple(sorted(labels.items())))] += value
 
     async def init(self) -> None:
         """Learn our own id and @username (needed to spot mentions and replies in groups)."""
@@ -159,6 +165,7 @@ class Bot:
             if not self.store.resolve_task(task.id, "expired"):
                 continue
             self.store.audit("expire", chat_id=task.chat_id, task_id=task.id, detail="pending when the bot restarted")
+            self.count("approvals_total", outcome="expired")
             try:
                 await self.backends[task.backend].resolve_approval(task.ref, False)
             except (BackendError, KeyError) as e:  # usually gone with the old process anyway
@@ -373,13 +380,21 @@ class Bot:
         await self.tg.send_chat_action(chat_id, thread_id=turn.thread_id)
         placeholder = await self.tg.send_message(chat_id, "…", thread_id=turn.thread_id)
         mid = placeholder["message_id"]
+        started = time.monotonic()
+        outcome = "error"
         try:
-            await self._try_backends(names, turn, mid)
+            outcome = await self._try_backends(names, turn, mid)
         except asyncio.CancelledError:  # /cancel or shutdown; nothing is stored
+            outcome = "cancelled"
             await self._safe_edit(chat_id, mid, self._stop_note.get((chat_id, turn.thread_id), "⏹ Stopped."))
             raise
+        finally:
+            self.count("turns_total", outcome=outcome)
+            self.count("turn_seconds_sum", time.monotonic() - started, outcome=outcome)
+            self.count("turn_seconds_count", outcome=outcome)
 
-    async def _try_backends(self, names: list[str], turn: Turn, mid: int) -> None:
+    async def _try_backends(self, names: list[str], turn: Turn, mid: int) -> str:
+        """Run the turn down the failover chain. Returns the outcome: ok, fallback, failed or error."""
         chat_id = turn.chat_id
         failed: list[tuple[str, BackendError]] = []
         for i, name in enumerate(names):
@@ -400,19 +415,21 @@ class Bot:
                     raise
             except BackendError as e:
                 log.warning("backend %s failed: %s", name, e)
+                self.count("backend_failures_total", backend=name)
                 failed.append((name, e))
                 if committed or i == len(names) - 1:  # can't retry output the user already saw
                     msg = f"⚠️ {e}" if len(failed) == 1 else "⚠️ All backends failed:\n" + "\n".join(
                         f"• {n}: {err}" for n, err in failed)
                     await self._safe_edit(chat_id, mid, msg)
-                    return
+                    return "failed"
                 await self._safe_edit(chat_id, mid, f"⏳ {name} failed ({e}); trying {names[i + 1]}")
                 continue
             except Exception:
                 log.exception("turn failed in chat %s", chat_id)
                 await self._safe_edit(chat_id, mid, "⚠️ Internal error, see bot logs.")
-                return
+                return "error"
             breaker.success()
+            self.count("backend_replies_total", backend=name)
             break
         text = text.strip() or "(empty reply)"
         note = ""
@@ -430,6 +447,7 @@ class Bot:
             text += f"\n\n*↪️ answered by {name}; {', '.join(n for n, _ in failed)} failed*"
         text += note
         await self._deliver(chat_id, mid, text, turn.thread_id)
+        return "fallback" if failed else "ok"
 
     async def _stream_backend(self, name: str, turn: Turn, mid: int, committed: list[bool]) -> str:
         """Stream one backend's reply into the placeholder message and return the full text."""
@@ -527,6 +545,7 @@ class Bot:
 
     async def ask_approval(self, chat_id: int, name: str, req: ApprovalRequest, thread: int = 0) -> None:
         tid = self.store.create_task(chat_id, name, req.ref, req.summary)
+        self.count("approvals_requested_total", backend=name)
         self.store.audit("request", chat_id=chat_id, task_id=tid, detail=f"{name}: {req.summary[:500]}")
         text = f"🔐 Approval needed (task #{tid}, {name}):\n\n{req.summary[:3500]}"
         keyboard = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"ap:{tid}:1"},
@@ -545,6 +564,7 @@ class Bot:
             return
         self.store.audit("approve" if approved else "deny", chat_id=task.chat_id, task_id=task.id,
                          detail=f"{decision} outside Telegram")
+        self.count("approvals_total", outcome="approved" if approved else "denied")
         if timer := self._timers.pop(task.id, None):
             timer.cancel()
         if prompt := self._prompts.pop(task.id, None):
@@ -567,6 +587,7 @@ class Bot:
         if not task or not self.store.resolve_task(tid, status):
             return
         self.store.audit(action, chat_id=task.chat_id, task_id=tid, detail=detail)
+        self.count("approvals_total", outcome=status)
         try:
             await self.backends[task.backend].resolve_approval(task.ref, False)
         except (BackendError, KeyError) as e:
@@ -615,6 +636,7 @@ class Bot:
             detail += f" [backend error: {e}]"
         self.store.audit("approve" if approve else "deny", user_id=user["id"], chat_id=task.chat_id,
                          task_id=task.id, detail=detail)
+        self.count("approvals_total", outcome="approved" if approve else "denied")
         await self.tg.answer_callback(cq["id"], outcome[:190])
         await self._safe_edit(task.chat_id, msg["message_id"], f"{msg.get('text', '')}\n\n{outcome}")
 

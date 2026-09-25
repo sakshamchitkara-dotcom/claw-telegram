@@ -36,7 +36,7 @@ Telegram ──► claw-telegram ──► OpenClaw gateway  (/v1/chat/completio
 | Streaming | Throttled `editMessageText` while tokens arrive, with a `⏳ tool` status line. The final reply is re-rendered as Telegram HTML from a safe Markdown subset (code fences, inline code, bold, italic, strike, headings, http(s) links). Replies longer than one message are paged in place with **Show more** buttons, without breaking code blocks. Very long ones arrive as a `.md` file. Falls back to plain text if Telegram rejects the markup. |
 | Media | Photos and image documents go to backends that accept images (data-URL `image_url` parts / Claude image blocks). Small text files are inlined. Voice notes are transcribed through any OpenAI-compatible `/audio/transcriptions` endpoint. |
 | Agent actions | Backend approval requests become persisted tasks with an inline keyboard. Each can be answered once, only by a role that is allowed to approve, and is **denied automatically** after `APPROVAL_TIMEOUT_S`. Every decision goes to an audit table: `/tasks` shows the chat's tasks and `/audit` shows the full log. |
-| Ops | Per-user rate limit, one in-flight turn per chat (`/cancel` stops it), chats handled concurrently, `/healthz`, optional password-protected read-only `/admin` page, clean shutdown, Dockerfile, docker-compose (with optional Ollama and Hermes Agent), hardened systemd unit, CI. |
+| Ops | Per-user rate limit, one in-flight turn per chat (`/cancel` stops it), chats handled concurrently, `/healthz`, Prometheus `/metrics`, optional password-protected read-only `/admin` page, clean shutdown, Dockerfile, docker-compose (with optional Ollama and Hermes Agent), hardened systemd unit, CI. |
 
 ## Quick start
 
@@ -129,6 +129,10 @@ backend. Approval prompts from that run work as usual. Plain users can have up t
 - **Admin page:** set `ADMIN_PASSWORD` (16+ chars) and open `http://HOST:HTTP_PORT/admin` (HTTP Basic auth,
   any user name). It is read-only: backends and circuits, running replies, pending approvals, today's usage
   and the audit log. Put it behind TLS if the port is reachable from outside.
+- **Metrics:** `GET /metrics` serves Prometheus text format: turns by outcome and duration, replies and
+  failures per backend, approvals, running turns, backend health and circuit state. With `ADMIN_PASSWORD` set
+  it needs the same Basic auth (`basic_auth` in the Prometheus scrape config); without it, it is open like
+  `/healthz`.
 - **Webhook:** set `BOT_MODE=webhook`, `WEBHOOK_URL=https://your.host` and a random `WEBHOOK_SECRET`
   (16-256 chars of `A-Za-z0-9_-`, e.g. `openssl rand -hex 32`), and route `https://your.host/telegram/webhook`
   to `HTTP_PORT` through a TLS proxy. Add `WEBHOOK_IP_ALLOWLIST=telegram` to accept only Telegram's published

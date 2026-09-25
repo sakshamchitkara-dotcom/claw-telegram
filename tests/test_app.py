@@ -175,3 +175,46 @@ def test_admin_password_must_be_long():
     import pytest
     with pytest.raises(SystemExit, match="16 characters"):
         Settings.from_env({"TELEGRAM_BOT_TOKEN": "t", "ADMIN_PASSWORD": "short"})
+
+
+async def test_metrics_in_prometheus_format():
+    import base64
+    import re
+
+    from test_failover import Down
+
+    from claw_telegram.backends.echo import EchoBackend
+
+    pw = "a-long-admin-password"
+    backends = {"echo": EchoBackend(), "down": Down()}
+    async with harness(backends=backends, admin_password=pw, fallback_backends=("echo",)) as h:
+        await h.bot.health.check("echo")
+        for text in ("hello", "/backend down", "hi", "/backend echo"):  # hi: down fails, echo answers
+            h.fake.push_message(OWNER, text)
+            await h.pump()
+        h.fake.push_message(OWNER, "!task deploy")
+        await h.pump(drain=False)
+        await asyncio.sleep(0.05)
+        prompt = h.fake.with_keyboard(OWNER)[-1]
+        h.fake.push_callback(OWNER, prompt, "ap:1:0")
+        await h.pump()
+        async with serve(make_web_app(h.bot, h.bot.s)) as url, aiohttp.ClientSession() as http:
+            async with http.get(url + "/metrics") as r:
+                assert r.status == 401
+            auth = "Basic " + base64.b64encode(f"x:{pw}".encode()).decode()
+            async with http.get(url + "/metrics", headers={"Authorization": auth}) as r:
+                assert r.status == 200 and r.content_type == "text/plain"
+                body = await r.text()
+    samples = dict(re.findall(r"^(claw_\S+) (\S+)$", body, re.M))
+    assert samples['claw_turns_total{outcome="ok"}'] == "2"  # hello, and the denied !task
+    assert samples['claw_turns_total{outcome="fallback"}'] == "1"
+    assert samples['claw_backend_failures_total{backend="down"}'] == "1"
+    assert samples['claw_backend_replies_total{backend="echo"}'] == "3"
+    assert samples['claw_approvals_total{outcome="denied"}'] == "1"
+    assert samples['claw_turn_seconds_count{outcome="ok"}'] == "2"
+    assert samples['claw_backend_up{backend="echo"}'] == "1"
+    assert samples['claw_circuit_state{backend="echo",state="closed"}'] == "1"
+    assert samples["claw_turns_running"] == "0" and samples["claw_updates_total"] == "0"
+    assert "# TYPE claw_turn_seconds summary" in body and body.endswith("\n")
+    for line in body.splitlines():  # every line is a comment or `name{labels} number`
+        assert line.startswith("# ") or re.fullmatch(r'claw_\w+(\{[^}]*\})? -?[\d.e+]+', line), line
