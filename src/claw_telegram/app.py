@@ -146,6 +146,7 @@ async def run(settings: Settings, stop: asyncio.Event | None = None) -> None:
                 if not poller.cancelled() and poller.done() and poller.exception():
                     raise poller.exception()
         finally:
+            await bot.shutdown()
             scheduler.cancel()
             if prober:
                 prober.cancel()

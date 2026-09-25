@@ -177,6 +177,16 @@ class Bot:
         task.add_done_callback(self._tasks.discard)
         return task
 
+    async def shutdown(self, grace: float = 10) -> None:
+        """Stop cleanly: deny open approvals and mark interrupted replies instead of leaving "…" behind."""
+        for tid in list(self._prompts):
+            await self._auto_deny(tid, "expired", "expire", "bot shut down", "⌛ The bot restarted: denied.")
+        for key, task in list(self._turns.items()):
+            self._stop_note[key] = "⚠️ The bot restarted before this reply finished. Please send it again."
+            task.cancel()
+        if self._tasks:
+            await asyncio.wait(list(self._tasks), timeout=grace)
+
     async def drain(self) -> None:
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)

@@ -47,3 +47,22 @@ async def test_cancel_denies_the_approval_the_turn_was_waiting_for():
         await h.pump()
         answers = [p["text"] for m, p in h.fake.calls if m == "answerCallbackQuery"]
         assert answers == ["Already resolved."]
+
+
+async def test_shutdown_marks_interrupted_replies_and_denies_open_approvals():
+    from claw_telegram.backends.echo import EchoBackend
+
+    other = 2002
+    async with harness(backends={"slow": Slow(), "echo": EchoBackend()}, default_backend="slow",
+                       allowed_user_ids=frozenset({OWNER, other})) as h:
+        h.bot.store.set_backend(other, "echo")
+        h.fake.push_message(OWNER, "long job")
+        h.fake.push_message(other, "!task reboot")
+        await h.pump(drain=False)
+        await asyncio.sleep(0.05)
+        await h.bot.shutdown(grace=2)
+        assert h.fake.texts(OWNER) == ["⚠️ The bot restarted before this reply finished. Please send it again."]
+        (prompt,) = [m for m in h.fake.sent(other) if "Approval needed" in m["text"]]
+        assert prompt["text"].endswith("⌛ The bot restarted: denied.") and "reply_markup" not in prompt
+        assert h.bot.store.get_task(1).status == "expired"
+        assert not h.bot._tasks
