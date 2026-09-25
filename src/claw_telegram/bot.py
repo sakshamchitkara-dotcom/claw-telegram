@@ -7,11 +7,14 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
 from .config import ROLES, Settings
 from .formatting import render, split_plain
 from .ratelimit import RateLimiter
+from .schedule import next_run, parse_when, split_spec
 from .store import Store
 from .telegram import Telegram, TelegramError
 from .transcribe import Transcriber, TranscriptionError
@@ -25,6 +28,10 @@ COMMANDS = [
     ("backend", "Show or switch the agent backend"),
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
+    ("remind", "Remind me: /remind 10m text, /remind 14:30 text"),
+    ("every", "Repeat a prompt: /every 0 9 * * * prompt, /every 2h prompt"),
+    ("schedules", "List reminders and repeating prompts"),
+    ("unschedule", "Cancel a reminder or repeating prompt"),
     ("users", "Admins: list, add or remove users"),
     ("audit", "Admins: approval and user-change log"),
 ]
@@ -62,6 +69,9 @@ class Bot:
         self.backends = backends
         self.limiter = RateLimiter(settings.rate_limit_per_minute)
         self.started = time.time()
+        # ponytail: without TIMEZONE the host's current UTC offset is used, so DST changes need a restart.
+        self.tz = ZoneInfo(settings.timezone) if settings.timezone else datetime.now().astimezone().tzinfo
+        self._sched_wake = asyncio.Event()
         self._busy: dict[int, str] = {}  # chat_id -> backend name of the in-flight turn
         self._tasks: set[asyncio.Task] = set()
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
@@ -502,3 +512,117 @@ class Bot:
                          + (f": {first}" if first else ""))
         for chunk in split_plain("\n".join(lines)):
             await self.tg.send_message(ctx.chat_id, chunk)
+
+    # ---- schedules --------------------------------------------------------------
+
+    def _fmt(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, self.tz).strftime("%a %Y-%m-%d %H:%M %Z").strip()
+
+    async def _schedule_quota_ok(self, ctx: Ctx) -> bool:
+        if ctx.role != "owner" and self.store.count_schedules(ctx.user_id) >= self.s.max_schedules_per_user:
+            await self.tg.send_message(ctx.chat_id, f"You already have {self.s.max_schedules_per_user} schedules. "
+                                                    "Remove one with /unschedule.")
+            return False
+        return True
+
+    async def cmd_remind(self, ctx: Ctx, arg: str) -> None:
+        when, _, text = arg.partition(" ")
+        if not text.strip():
+            await self.tg.send_message(ctx.chat_id, "Usage: /remind <10m|2h30m|14:30|2026-10-01T09:00> <text>")
+            return
+        try:
+            at = parse_when(when, datetime.now(self.tz))
+        except ValueError as e:
+            await self.tg.send_message(ctx.chat_id, str(e))
+            return
+        if not await self._schedule_quota_ok(ctx):
+            return
+        sid = self.store.add_schedule(ctx.chat_id, ctx.user_id, "remind", when, text.strip(), at.timestamp())
+        self._sched_wake.set()
+        await self.tg.send_message(ctx.chat_id, f"⏰ Reminder #{sid} set for {self._fmt(at.timestamp())}.")
+
+    async def cmd_every(self, ctx: Ctx, arg: str) -> None:
+        spec, prompt = split_spec(arg)
+        if not prompt.strip():
+            await self.tg.send_message(ctx.chat_id, "Usage: /every <cron: m h dom mon dow | @daily | 2h> <prompt>\n"
+                                                    "e.g. /every 0 9 * * 1-5 Summarise my calendar")
+            return
+        try:
+            first = next_run(spec, datetime.now(self.tz))
+        except ValueError as e:
+            await self.tg.send_message(ctx.chat_id, f"Bad schedule: {e}")
+            return
+        name = self.backend_name(ctx.chat_id)
+        if not self.s.backend_allowed(ctx.role, name):
+            await self.tg.send_message(ctx.chat_id, f"Your role ({ctx.role}) can't use the {name} backend.")
+            return
+        if not await self._schedule_quota_ok(ctx):
+            return
+        sid = self.store.add_schedule(ctx.chat_id, ctx.user_id, "every", spec, prompt.strip(), first.timestamp())
+        self._sched_wake.set()
+        await self.tg.send_message(ctx.chat_id, f"🔁 #{sid} runs `{spec}` on this chat's backend. "
+                                                f"Next: {self._fmt(first.timestamp())}.")
+
+    async def cmd_schedules(self, ctx: Ctx, arg: str) -> None:
+        items = self.store.list_schedules(ctx.chat_id)
+        if not items:
+            await self.tg.send_message(ctx.chat_id, "Nothing scheduled. See /remind and /every.")
+            return
+        lines = [f"{'⏰' if sc.kind == 'remind' else '🔁'} #{sc.id} "
+                 + (f"at {self._fmt(sc.next_run)}" if sc.kind == "remind"
+                    else f"{sc.spec}, next {self._fmt(sc.next_run)}, ran {sc.runs}x")
+                 + f": {sc.text[:80]}" for sc in items]
+        await self.tg.send_message(ctx.chat_id, "\n".join(lines) + "\n\nCancel with /unschedule <id>.")
+
+    async def cmd_unschedule(self, ctx: Ctx, arg: str) -> None:
+        sc = self.store.get_schedule(int(arg.lstrip("#"))) if arg.lstrip("#").isdigit() else None
+        if sc is None or sc.chat_id != ctx.chat_id:
+            await self.tg.send_message(ctx.chat_id, "No such schedule in this chat. See /schedules.")
+            return
+        if sc.user_id != ctx.user_id and not self._at_least(ctx, "admin"):
+            await self.tg.send_message(ctx.chat_id, "Only its creator or an admin can cancel it.")
+            return
+        self.store.delete_schedule(sc.id)
+        await self.tg.send_message(ctx.chat_id, f"Cancelled #{sc.id}.")
+
+    async def scheduler(self) -> None:
+        """Fire due schedules forever. Missed runs (bot was down) fire once, late."""
+        while True:
+            try:
+                await self.run_due()
+            except Exception:
+                log.exception("scheduler tick failed")
+            nxt = self.store.next_due()
+            wait = 30.0 if nxt is None else min(30.0, max(0.2, nxt - time.time()))
+            self._sched_wake.clear()
+            try:
+                await asyncio.wait_for(self._sched_wake.wait(), wait)
+            except asyncio.TimeoutError:
+                pass
+
+    async def run_due(self) -> None:
+        now = time.time()
+        for sc in self.store.due_schedules(now):
+            late = now - sc.next_run > 120
+            role = self.role_of({"id": sc.user_id})
+            if role is None:  # creator lost access
+                self.store.delete_schedule(sc.id)
+                log.info("dropped schedule %s: user %s no longer allowed", sc.id, sc.user_id)
+                continue
+            if sc.kind == "remind":
+                self.store.delete_schedule(sc.id)
+                note = " (late: the bot was offline)" if late else ""
+                await self.tg.send_message(sc.chat_id, f"⏰ Reminder{note}: {sc.text}")
+                continue
+            if sc.chat_id in self._busy:  # try again shortly without counting a run
+                self.store.reschedule(sc.id, now + 15, ran=False)
+                continue
+            try:
+                nxt = next_run(sc.spec, datetime.now(self.tz)).timestamp()
+            except ValueError as e:
+                self.store.delete_schedule(sc.id)
+                await self.tg.send_message(sc.chat_id, f"Removed schedule #{sc.id}: {e}")
+                continue
+            self.store.reschedule(sc.id, nxt)  # before running, so a crash can't replay it
+            await self.tg.send_message(sc.chat_id, f"🔁 #{sc.id}: {sc.text[:300]}")
+            await self._start_turn(Ctx(sc.chat_id, sc.user_id, role, {}), sc.text, [])

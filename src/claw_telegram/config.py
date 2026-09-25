@@ -55,6 +55,8 @@ class Settings:
     rate_limit_per_minute: int = 20
     approval_timeout_s: int = 300
     stream_edit_interval_s: float = 1.2
+    timezone: str = ""  # IANA name for /remind and /every; empty = the host's local time
+    max_schedules_per_user: int = 20
     system_prompt: str = "You are a helpful personal assistant talking to the user over Telegram."
     # OpenClaw gateway
     openclaw_url: str = ""
@@ -108,6 +110,8 @@ class Settings:
             rate_limit_per_minute=int(e.get("RATE_LIMIT_PER_MINUTE", cls.rate_limit_per_minute)),
             approval_timeout_s=int(e.get("APPROVAL_TIMEOUT_S", cls.approval_timeout_s)),
             stream_edit_interval_s=float(e.get("STREAM_EDIT_INTERVAL_S", cls.stream_edit_interval_s)),
+            timezone=e.get("TIMEZONE") or e.get("TZ", ""),
+            max_schedules_per_user=int(e.get("MAX_SCHEDULES_PER_USER", cls.max_schedules_per_user)),
             system_prompt=e.get("SYSTEM_PROMPT", cls.system_prompt),
             openclaw_url=e.get("OPENCLAW_URL", "").rstrip("/"),
             openclaw_token=e.get("OPENCLAW_TOKEN", ""),

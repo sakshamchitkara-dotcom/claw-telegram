@@ -38,6 +38,18 @@ CREATE TABLE IF NOT EXISTS users (
     added_by INTEGER,
     created REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('remind', 'every')),
+    spec TEXT NOT NULL,
+    text TEXT NOT NULL,
+    next_run REAL NOT NULL,
+    runs INTEGER NOT NULL DEFAULT 0,
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS schedules_due ON schedules (next_run);
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -70,6 +82,18 @@ class AuditEntry:
     action: str
     task_id: int | None
     detail: str
+
+
+@dataclass
+class Schedule:
+    id: int
+    chat_id: int
+    user_id: int
+    kind: str  # remind (one-shot text) | every (repeating backend prompt)
+    spec: str
+    text: str
+    next_run: float
+    runs: int
 
 
 class Store:
@@ -175,3 +199,36 @@ class Store:
         rows = self.db.execute(f"SELECT id, ts, user_id, chat_id, action, task_id, detail FROM audit {where} "
                                "ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
         return [AuditEntry(*r) for r in rows]
+
+    # ---- scheduled reminders and prompts -------------------------------------
+
+    _SCHED = "SELECT id, chat_id, user_id, kind, spec, text, next_run, runs FROM schedules"
+
+    def add_schedule(self, chat_id: int, user_id: int, kind: str, spec: str, text: str, next_run: float) -> int:
+        return self.db.execute("INSERT INTO schedules (chat_id, user_id, kind, spec, text, next_run, created) "
+                               "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (chat_id, user_id, kind, spec, text, next_run, time.time())).lastrowid
+
+    def due_schedules(self, now: float) -> list[Schedule]:
+        return [Schedule(*r) for r in self.db.execute(f"{self._SCHED} WHERE next_run <= ? ORDER BY next_run",
+                                                      (now,)).fetchall()]
+
+    def next_due(self) -> float | None:
+        return self.db.execute("SELECT MIN(next_run) FROM schedules").fetchone()[0]
+
+    def list_schedules(self, chat_id: int) -> list[Schedule]:
+        return [Schedule(*r) for r in self.db.execute(f"{self._SCHED} WHERE chat_id = ? ORDER BY next_run",
+                                                      (chat_id,)).fetchall()]
+
+    def count_schedules(self, user_id: int) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM schedules WHERE user_id = ?", (user_id,)).fetchone()[0]
+
+    def get_schedule(self, sid: int) -> Schedule | None:
+        row = self.db.execute(f"{self._SCHED} WHERE id = ?", (sid,)).fetchone()
+        return Schedule(*row) if row else None
+
+    def reschedule(self, sid: int, next_run: float, ran: bool = True) -> None:
+        self.db.execute("UPDATE schedules SET next_run = ?, runs = runs + ? WHERE id = ?", (next_run, int(ran), sid))
+
+    def delete_schedule(self, sid: int) -> bool:
+        return self.db.execute("DELETE FROM schedules WHERE id = ?", (sid,)).rowcount == 1
