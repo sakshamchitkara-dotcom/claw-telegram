@@ -73,6 +73,7 @@ async def test_exec_approval_over_websocket():
     assert connect["method"] == "connect" and p["minProtocol"] == 4 and p["role"] == "operator"
     assert p["client"]["id"] == "gateway-client" and p["client"]["mode"] == "backend"
     assert "operator.approvals" in p["scopes"] and p["auth"] == {"token": "gw-token"}
+    assert p["caps"] == ["exec-approvals"]  # without it the gateway never sends the event
     assert got == [ApprovalRequest(ref="ap-1", summary="exec on gateway: git push --force")]
     assert resolve["method"] == "exec.approval.resolve"
     assert resolve["params"] == {"id": "ap-1", "decision": "deny"}

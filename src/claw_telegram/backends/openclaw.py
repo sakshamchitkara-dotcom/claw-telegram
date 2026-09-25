@@ -18,8 +18,10 @@ packages/gateway-protocol/src/schema/exec-approvals.ts):
 - Gateway broadcasts `exec.approval.requested`; operators answer with
   `exec.approval.resolve {id, decision}` (scope operator.approvals),
   decisions "allow-once" | "allow-always" | "deny".
-Assumed: the requested-event payload carries `id` and `request.command`
-(inferred from the Android client parser, not a published schema).
+- The client must declare caps ["exec-approvals"] to receive the event
+  (found in the gateway source; observed against a live 2026.9.6 gateway).
+- Observed payload: {"approvalKind": "exec", "id", "request": {"command",
+  "host", "allowedDecisions", "sessionKey", ...}, "createdAtMs", "expiresAtMs"}.
 """
 
 from __future__ import annotations
@@ -111,8 +113,12 @@ class OpenClawBackend(OpenAICompatBackend):
                 "client": {"id": "gateway-client", "mode": "backend", "version": __version__,
                            "platform": platform.system().lower()},
                 "role": "operator",
-                "scopes": ["operator.read", "operator.approvals"],
-                "caps": [], "commands": [], "permissions": {},
+                # Verified against gateway 2026.9.6: exec.approval.requested is only delivered to
+                # clients declaring the "exec-approvals" cap, and approvals bound to another
+                # device/session are only visible with operator.admin. The shared gateway token
+                # already carries owner authority, so asking for admin adds no real privilege.
+                "scopes": ["operator.read", "operator.approvals", "operator.admin"],
+                "caps": ["exec-approvals"], "commands": [], "permissions": {},
                 "auth": {"token": self.api_key},
                 "userAgent": f"claw-telegram/{__version__}",
             },
