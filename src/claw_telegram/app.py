@@ -77,7 +77,7 @@ def make_web_app(bot: Bot, settings: Settings) -> web.Application:
             recent.popitem(last=False)
         stats["updates"] += 1
         stats["last_update"] = int(time.time())
-        bot.spawn(bot.handle_update(update))  # ack fast; Telegram retries slow webhooks
+        bot.submit(update)  # ack fast; Telegram retries slow webhooks
         return web.Response(text="ok")
 
     app.router.add_get("/healthz", healthz)
@@ -103,8 +103,7 @@ async def poll(bot: Bot, tg: Telegram, stats: dict, stop: asyncio.Event) -> None
             offset = update["update_id"] + 1
             stats["updates"] += 1
             stats["last_update"] = int(time.time())
-            # ponytail: updates are handled in order; long agent turns already run in the background.
-            await bot.handle_update(update)
+            bot.submit(update)  # a slow voice note in one chat doesn't hold up the others
 
 
 async def run(settings: Settings, stop: asyncio.Event | None = None) -> None:

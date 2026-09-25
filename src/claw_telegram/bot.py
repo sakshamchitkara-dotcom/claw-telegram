@@ -127,6 +127,7 @@ class Bot:
         self._busy: dict[tuple[int, int], str] = {}  # (chat, topic) -> backend name of the in-flight turn
         self._committed: dict[tuple[int, int], list[bool]] = {}  # (chat, topic) -> has the user seen output?
         self._tasks: set[asyncio.Task] = set()
+        self._chat_tail: dict[int, asyncio.Task] = {}  # chat -> its newest queued update
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
         self._prompts: dict[int, tuple[int, int, str]] = {}  # task id -> (chat, message id, text)
         for name, backend in backends.items():
@@ -150,6 +151,22 @@ class Bot:
                 await self._on_callback(update["callback_query"])
         except Exception:
             log.exception("failed to handle update %s", update.get("update_id"))
+
+    def submit(self, update: dict) -> asyncio.Task:
+        """Handle an update in the background: chats run concurrently, each chat's updates in order."""
+        where = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+        chat = (where.get("chat") or {}).get("id", 0)
+        prev = self._chat_tail.get(chat)
+
+        async def run() -> None:
+            if prev is not None:
+                await asyncio.wait({prev})
+            await self.handle_update(update)
+
+        task = self.spawn(run())
+        self._chat_tail[chat] = task
+        task.add_done_callback(lambda t: self._chat_tail.pop(chat) if self._chat_tail.get(chat) is t else None)
+        return task
 
     def spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)

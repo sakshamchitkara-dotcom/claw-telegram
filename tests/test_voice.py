@@ -44,3 +44,35 @@ async def test_transcription_failure_is_reported():
         await h.pump()
         await h.bot.transcriber.close()
         assert h.fake.texts(OWNER)[0].startswith("Transcription failed: cannot reach")
+
+
+async def test_slow_transcription_does_not_block_other_chats_but_keeps_chat_order():
+    import asyncio
+
+    gate = asyncio.Event()
+
+    async def slow(audio, name):
+        await gate.wait()
+        return "hello from a voice note"
+
+    other = 2002
+    async with harness(allowed_user_ids=frozenset({OWNER, other})) as h:
+        h.bot.transcriber = slow
+        h.fake.add_file("v1", b"OggS")
+        updates = [h.fake.push_message(OWNER, voice={"file_id": "v1", "duration": 60}),
+                   h.fake.push_message(OWNER, "/help"),  # same chat: must wait for the voice note
+                   h.fake.push_message(other, "/help")]  # other chat: answered right away
+        for u in updates:
+            h.bot.submit(u)
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if h.fake.texts(other):
+                break
+        assert h.fake.texts(other)[0].startswith("/start")
+        assert h.fake.texts(OWNER) == []
+        gate.set()
+        await h.bot.drain()
+        texts = h.fake.texts(OWNER)
+        assert texts[0] == "🎙 hello from a voice note"  # the /help answer came after it
+        assert any(t.startswith("/start") for t in texts[1:])
+        assert h.bot._chat_tail == {}
