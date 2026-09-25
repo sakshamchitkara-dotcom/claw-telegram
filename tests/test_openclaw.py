@@ -49,7 +49,8 @@ async def test_exec_approval_over_websocket():
         resolve = await ws.receive_json()
         frames_in.append(resolve)
         await ws.send_json({"type": "res", "id": resolve["id"], "ok": True, "payload": {"ok": True}})
-        resolved.set()
+        await ws.send_json({"type": "event", "event": "exec.approval.resolved",
+                            "payload": {"id": "ap-1", "decision": "deny", "request": {}}})
         await ws.receive()  # wait for client close
         return ws
 
@@ -63,7 +64,13 @@ async def test_exec_approval_over_websocket():
             got.append(req)
             asyncio.create_task(b.resolve_approval(req.ref, False))
 
+        async def on_resolved(ref, decision):
+            got_resolved.append((ref, decision))
+            resolved.set()
+
+        got_resolved: list = []
         b.approval_sink = sink
+        b.resolved_sink = on_resolved
         b.start()
         await asyncio.wait_for(resolved.wait(), 5)
         await b.close()
@@ -77,3 +84,4 @@ async def test_exec_approval_over_websocket():
     assert got == [ApprovalRequest(ref="ap-1", summary="exec on gateway: git push --force")]
     assert resolve["method"] == "exec.approval.resolve"
     assert resolve["params"] == {"id": "ap-1", "decision": "deny"}
+    assert got_resolved == [("ap-1", "deny")]

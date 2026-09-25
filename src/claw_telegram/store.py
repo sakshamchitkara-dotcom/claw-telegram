@@ -101,6 +101,11 @@ class Store:
                               (task_id,)).fetchone()
         return Task(*row) if row else None
 
+    def find_pending_task(self, backend: str, ref: str) -> Task | None:
+        row = self.db.execute("SELECT id, chat_id, backend, ref, summary, status, created FROM tasks "
+                              "WHERE backend = ? AND ref = ? AND status = 'pending'", (backend, ref)).fetchone()
+        return Task(*row) if row else None
+
     def resolve_task(self, task_id: int, status: str) -> bool:
         """Move a pending task to a final status. Returns False if it was already resolved."""
         cur = self.db.execute("UPDATE tasks SET status = ?, resolved = ? WHERE id = ? AND status = 'pending'",

@@ -53,9 +53,12 @@ class Bot:
         self._busy: dict[int, str] = {}  # chat_id -> backend name of the in-flight turn
         self._tasks: set[asyncio.Task] = set()
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
+        self._prompts: dict[int, tuple[int, int, str]] = {}  # task id -> (chat, message id, text)
         for name, backend in backends.items():
             if hasattr(backend, "approval_sink"):  # backends that raise approvals out of band
                 backend.approval_sink = lambda req, name=name: self._external_approval(name, req)
+            if hasattr(backend, "resolved_sink"):  # ...and can report approvals answered elsewhere
+                backend.resolved_sink = lambda ref, decision, name=name: self._resolved_elsewhere(name, ref, decision)
 
     # ---- entry point ----------------------------------------------------------
 
@@ -238,11 +241,28 @@ class Bot:
         keyboard = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"ap:{tid}:1"},
                                          {"text": "❌ Deny", "callback_data": f"ap:{tid}:0"}]]}
         msg = await self.tg.send_message(chat_id, text, reply_markup=keyboard)
+        self._prompts[tid] = (chat_id, msg["message_id"], text)
         self._timers[tid] = asyncio.create_task(self._expire(tid, chat_id, msg["message_id"], text))
+
+    async def _resolved_elsewhere(self, name: str, ref: str, decision: str) -> None:
+        """The backend reports an approval was answered by another client (e.g. OpenClaw Control UI)."""
+        task = self.store.find_pending_task(name, ref)
+        if task is None:
+            return  # unknown, or we resolved it ourselves
+        approved = decision.startswith("allow")
+        if not self.store.resolve_task(task.id, "approved" if approved else "denied"):
+            return
+        if timer := self._timers.pop(task.id, None):
+            timer.cancel()
+        if prompt := self._prompts.pop(task.id, None):
+            chat_id, mid, text = prompt
+            mark = "✅" if approved else "❌"
+            await self._safe_edit(chat_id, mid, f"{text}\n\n{mark} {decision} (resolved outside Telegram)")
 
     async def _expire(self, tid: int, chat_id: int, mid: int, text: str) -> None:
         await asyncio.sleep(self.s.approval_timeout_s)
         self._timers.pop(tid, None)
+        self._prompts.pop(tid, None)
         task = self.store.get_task(tid)
         if task and self.store.resolve_task(tid, "expired"):
             try:
@@ -273,6 +293,7 @@ class Bot:
             return
         if timer := self._timers.pop(task.id, None):
             timer.cancel()
+        self._prompts.pop(task.id, None)
         who = user.get("username") or user.get("first_name") or str(user["id"])
         outcome = f"✅ Approved by {who}" if approve else f"❌ Denied by {who}"
         try:

@@ -89,6 +89,7 @@ Checked against the upstream docs **and** against live local installs (OpenClaw 
 | OpenClaw `GET /v1/models` lists agent targets | **Confirmed**: docs and live |
 | OpenClaw WS handshake: `connect.challenge`, then `connect` req (protocol 4), `client.id=gateway-client`, `mode=backend`, token auth without device identity on loopback | **Confirmed**: docs and live |
 | OpenClaw `exec.approval.requested` event and `exec.approval.resolve {id, decision: allow-once/deny}` | **Confirmed**: docs, schema and live round trip |
+| OpenClaw `exec.approval.resolved` (answered in another client or expired on the gateway) updates the Telegram prompt and disables its buttons | **Confirmed live** (a gateway-side expiry arrived as `decision: "deny"`) |
 | OpenClaw clients must declare cap `exec-approvals` (and need `operator.admin` to see approvals bound to another device) | **Found in gateway source and confirmed live.** The docs don't mention it. |
 | OpenClaw accepts `data:` URL images in `image_url` parts | **Assumed**. Docs cover `image_url` parts and a URL allowlist policy, but data URLs weren't tested live. |
 | Routing OpenClaw approvals to a chat (the chat waiting on OpenClaw, else the lowest allowlisted user ID) | **Design choice**. The event's `sessionKey` isn't mapped back to a Telegram chat. |
@@ -104,7 +105,7 @@ Checked against the upstream docs **and** against live local installs (OpenClaw 
 
 ```bash
 pip install -e '.[claude,dev]'
-ruff check src tests scripts && pytest -q          # 64 tests, no network needed
+ruff check src tests scripts && pytest -q          # 65 tests, no network needed
 python scripts/e2e_fake_telegram.py               # real bot process <-> fake Telegram <-> mock backend
 python scripts/e2e_fake_telegram.py --backend openai \
   --env OPENAI_BASE_URL=http://localhost:11434/v1 --env OPENAI_MODEL=hermes3:3b
@@ -161,8 +162,6 @@ ls: /tmp/claude-501/hh-demo: No such file or directory
 
 ## Limitations
 
-- OpenClaw approvals resolved elsewhere (Control UI, another client) leave the Telegram buttons in place
-  until they are pressed or time out. `exec.approval.resolved` is not tracked yet.
 - Plugin approvals (`plugin.approval.*`) and Hermes' `session`/`always` choices are not exposed. Approve means once.
 - Updates are handled in order. A long voice transcription delays other chats' updates in polling mode.
 

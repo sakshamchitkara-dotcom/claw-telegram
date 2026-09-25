@@ -42,6 +42,7 @@ from .openai_compat import OpenAICompatBackend
 log = logging.getLogger(__name__)
 
 ApprovalSink = Callable[[ApprovalRequest], Awaitable[None]]
+ResolvedSink = Callable[[str, str], Awaitable[None]]  # (approval id, decision)
 
 
 class OpenClawBackend(OpenAICompatBackend):
@@ -53,6 +54,7 @@ class OpenClawBackend(OpenAICompatBackend):
         super().__init__(f"{self.root}/v1", agent, api_key=token, **kw)
         self.approvals_ws = approvals_ws
         self.approval_sink: ApprovalSink | None = None
+        self.resolved_sink: ResolvedSink | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_task: asyncio.Task | None = None
         self._ws_ready = asyncio.Event()
@@ -139,6 +141,10 @@ class OpenClawBackend(OpenAICompatBackend):
                     fut.set_result(frame.get("payload"))
                 else:
                     fut.set_exception(BackendError(f"openclaw rpc error: {frame.get('error')}"))
+        elif frame.get("type") == "event" and frame.get("event") == "exec.approval.resolved":
+            payload = frame.get("payload") or {}
+            if self.resolved_sink and payload.get("id"):
+                await self.resolved_sink(str(payload["id"]), str(payload.get("decision") or "expired"))
         elif frame.get("type") == "event" and frame.get("event") == "exec.approval.requested":
             payload = frame.get("payload") or {}
             req = payload.get("request") or {}

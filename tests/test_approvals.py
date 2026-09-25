@@ -104,3 +104,26 @@ async def test_out_of_band_approval_goes_to_owner():
         h.fake.push_callback(OWNER, prompt, buttons(prompt)[0])
         await h.pump()
         assert oob.resolved == [("ap-9", True)]
+
+
+async def test_approval_answered_elsewhere_updates_prompt():
+    class OOB:
+        approval_sink = None
+        resolved_sink = None
+
+        async def resolve_approval(self, ref, approve):
+            raise AssertionError("must not be called")
+
+    from claw_telegram.backends.echo import EchoBackend
+    oob = OOB()
+    async with harness(backends={"echo": EchoBackend(), "openclaw": oob}) as h:
+        await oob.approval_sink(ApprovalRequest("ap-7", "exec: make deploy"))
+        prompt = h.fake.with_keyboard(OWNER)[0]
+        await oob.resolved_sink("ap-7", "deny")
+        await oob.resolved_sink("unknown", "allow-once")  # ignored
+        assert h.bot.store.get_task(1).status == "denied"
+        assert prompt["text"].endswith("❌ deny (resolved outside Telegram)") and "reply_markup" not in prompt
+        h.fake.push_callback(OWNER, prompt, "ap:1:1")  # stale button
+        await h.pump()
+        answers = [p["text"] for m, p in h.fake.calls if m == "answerCallbackQuery"]
+        assert answers == ["Already resolved."]
