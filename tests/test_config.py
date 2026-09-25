@@ -40,3 +40,10 @@ def test_roles_tiers_backends_and_approval_rights():
     assert s.backend_allowed("admin", "hermes") and s.backend_allowed("owner", "anything")
     assert s.can_approve("owner") and not s.can_approve("admin") and not s.can_approve("user")
     assert not s.can_approve(None)
+
+
+def test_webhook_ip_allowlist_parsing():
+    s = Settings.from_env({"TELEGRAM_BOT_TOKEN": "t", "WEBHOOK_IP_ALLOWLIST": "telegram, 203.0.113.7"})
+    assert [str(n) for n in s.webhook_ip_allowlist] == ["149.154.160.0/20", "91.108.4.0/22", "203.0.113.7/32"]
+    with pytest.raises(ValueError):
+        Settings.from_env({"TELEGRAM_BOT_TOKEN": "t", "WEBHOOK_IP_ALLOWLIST": "10.0.0.0/33"})

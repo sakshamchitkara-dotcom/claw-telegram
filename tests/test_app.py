@@ -96,3 +96,38 @@ async def test_reminder_survives_restart(tmp_path):
         await wait_for(lambda: "⏰ Reminder: take the pizza out" in fake.texts(OWNER))
         stop.set()
         await asyncio.wait_for(task, 10)
+
+
+def test_client_ip_only_trusts_forwarded_for_from_trusted_proxies():
+    import ipaddress
+
+    from claw_telegram.app import client_ip
+    from claw_telegram.config import _networks
+
+    proxies = _networks("127.0.0.1, 10.0.0.0/8")
+    assert str(client_ip("149.154.167.1", "1.2.3.4", proxies)) == "149.154.167.1"  # not a proxy: header ignored
+    assert str(client_ip("127.0.0.1", "6.6.6.6, 149.154.167.1, 10.1.1.1", proxies)) == "149.154.167.1"
+    assert client_ip("127.0.0.1", "garbage", proxies) is None
+    assert ipaddress.ip_address("91.108.4.9") in _networks("telegram")[1]
+
+
+async def test_webhook_ip_allowlist():
+    from claw_telegram.config import _networks
+
+    update = {"update_id": 1, "message": {"message_id": 1, "chat": {"id": OWNER, "type": "private"},
+                                          "from": {"id": OWNER, "is_bot": False}, "text": "hi"}}
+    headers = {"X-Telegram-Bot-Api-Secret-Token": "s3cret"}
+    async with harness(mode="webhook", webhook_secret="s3cret", webhook_ip_allowlist=_networks("telegram"),
+                       webhook_trusted_proxies=_networks("127.0.0.1")) as h:
+        app = make_web_app(h.bot, h.bot.s)
+        async with serve(app) as url, aiohttp.ClientSession() as http:
+            async with http.post(url + WEBHOOK_PATH, json=update, headers=headers) as r:
+                assert r.status == 403  # 127.0.0.1 is a proxy, no forwarded client
+            async with http.post(url + WEBHOOK_PATH, json=update,
+                                 headers=headers | {"X-Forwarded-For": "8.8.8.8"}) as r:
+                assert r.status == 403
+            async with http.post(url + WEBHOOK_PATH, json=update,
+                                 headers=headers | {"X-Forwarded-For": "149.154.167.220"}) as r:
+                assert r.status == 200
+            await h.bot.drain()
+        assert h.fake.texts(OWNER)[0].startswith("echo: hi")

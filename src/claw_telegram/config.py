@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
+
+Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+# Telegram's published webhook source ranges (core.telegram.org/bots/webhooks)
+TELEGRAM_NETWORKS = ("149.154.160.0/20", "91.108.4.0/22")
+
+
+def _networks(raw: str) -> tuple[Network, ...]:
+    """Comma-separated CIDRs/IPs; the word "telegram" expands to Telegram's ranges. Typos crash at startup."""
+    out: list[Network] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.lower() == "telegram":
+            out.extend(ipaddress.ip_network(n) for n in TELEGRAM_NETWORKS)
+        elif part:
+            out.append(ipaddress.ip_network(part, strict=False))
+    return tuple(out)
 
 
 def _ids(raw: str) -> frozenset[int]:
@@ -50,6 +67,10 @@ class Settings:
     mode: str = "polling"  # polling | webhook
     webhook_url: str = ""
     webhook_secret: str = ""
+    # Webhook source filtering: empty = any IP. Behind a reverse proxy, list the proxy
+    # in webhook_trusted_proxies so the client IP is taken from X-Forwarded-For.
+    webhook_ip_allowlist: tuple[Network, ...] = ()
+    webhook_trusted_proxies: tuple[Network, ...] = ()
     http_host: str = "0.0.0.0"
     http_port: int = 8080
     db_path: str = "data/claw-telegram.db"
@@ -112,6 +133,8 @@ class Settings:
             mode=mode,
             webhook_url=e.get("WEBHOOK_URL", ""),
             webhook_secret=secret,
+            webhook_ip_allowlist=_networks(e.get("WEBHOOK_IP_ALLOWLIST", "")),
+            webhook_trusted_proxies=_networks(e.get("WEBHOOK_TRUSTED_PROXIES", "")),
             http_host=e.get("HTTP_HOST", cls.http_host),
             http_port=int(e.get("HTTP_PORT", cls.http_port)),
             db_path=e.get("DB_PATH", cls.db_path),

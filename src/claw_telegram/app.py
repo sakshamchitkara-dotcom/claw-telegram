@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import time
 
@@ -21,6 +22,23 @@ WEBHOOK_PATH = "/telegram/webhook"
 STATS = web.AppKey("stats", dict)
 
 
+def client_ip(remote: str | None, forwarded_for: str,
+              trusted: tuple) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The caller's IP: the socket peer, or, when that is a trusted proxy, the right-most
+    X-Forwarded-For entry that isn't one (entries left of it could be forged by the client)."""
+    try:
+        ip = ipaddress.ip_address(remote or "")
+    except ValueError:
+        return None
+    hops = [h.strip() for h in forwarded_for.split(",") if h.strip()]
+    while hops and any(ip in net for net in trusted):
+        try:
+            ip = ipaddress.ip_address(hops.pop())
+        except ValueError:
+            return None
+    return ip
+
+
 def make_web_app(bot: Bot, settings: Settings) -> web.Application:
     app = web.Application(client_max_size=4 * 1024 * 1024)
     stats = {"updates": 0, "last_update": None}
@@ -33,6 +51,12 @@ def make_web_app(bot: Bot, settings: Settings) -> web.Application:
         })
 
     async def webhook(request: web.Request) -> web.Response:
+        if settings.webhook_ip_allowlist:
+            ip = client_ip(request.remote, request.headers.get("X-Forwarded-For", ""),
+                           settings.webhook_trusted_proxies)
+            if ip is None or not any(ip in net for net in settings.webhook_ip_allowlist):
+                log.warning("webhook call from %s rejected by WEBHOOK_IP_ALLOWLIST", ip or request.remote)
+                return web.Response(status=403)
         given = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not hmac.compare_digest(given.encode(), settings.webhook_secret.encode()):
             log.warning("webhook call with bad secret from %s", request.remote)
