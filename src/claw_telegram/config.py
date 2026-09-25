@@ -54,6 +54,11 @@ class Settings:
     http_port: int = 8080
     db_path: str = "data/claw-telegram.db"
     default_backend: str = "echo"
+    # Failover: tried in order when the chat's backend fails before replying.
+    fallback_backends: tuple[str, ...] = ()
+    health_interval_s: float = 60  # 0 disables background health probes
+    circuit_failures: int = 3
+    circuit_cooldown_s: float = 60
     history_limit: int = 40
     rate_limit_per_minute: int = 20
     approval_timeout_s: int = 300
@@ -110,6 +115,10 @@ class Settings:
             http_port=int(e.get("HTTP_PORT", cls.http_port)),
             db_path=e.get("DB_PATH", cls.db_path),
             default_backend=e.get("DEFAULT_BACKEND", cls.default_backend),
+            fallback_backends=tuple(n.strip() for n in e.get("FALLBACK_BACKENDS", "").split(",") if n.strip()),
+            health_interval_s=float(e.get("HEALTH_INTERVAL_S", cls.health_interval_s)),
+            circuit_failures=int(e.get("CIRCUIT_FAILURES", cls.circuit_failures)),
+            circuit_cooldown_s=float(e.get("CIRCUIT_COOLDOWN_S", cls.circuit_cooldown_s)),
             history_limit=int(e.get("HISTORY_LIMIT", cls.history_limit)),
             rate_limit_per_minute=int(e.get("RATE_LIMIT_PER_MINUTE", cls.rate_limit_per_minute)),
             approval_timeout_s=int(e.get("APPROVAL_TIMEOUT_S", cls.approval_timeout_s)),

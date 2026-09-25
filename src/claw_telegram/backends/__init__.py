@@ -29,4 +29,6 @@ def build_backends(s: Settings) -> dict[str, Backend]:
         out["claude"] = ClaudeBackend(s.anthropic_model, system_prompt=s.system_prompt)
     if s.default_backend not in out:
         raise SystemExit(f"DEFAULT_BACKEND={s.default_backend!r} is not configured; available: {sorted(out)}")
+    if missing := [n for n in s.fallback_backends if n not in out]:
+        raise SystemExit(f"FALLBACK_BACKENDS lists unconfigured backends {missing}; available: {sorted(out)}")
     return out

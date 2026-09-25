@@ -57,3 +57,73 @@ async def test_health_probe_trips_and_recovers():
 def test_healthy_prefixes():
     assert healthy("ok") and healthy("live; models: ok (1 models)")
     assert not healthy("unreachable") and not healthy("error HTTP 500") and not healthy("timeout")
+
+
+# ---- failover inside the bot ---------------------------------------------------
+
+from harness import OWNER, harness  # noqa: E402
+
+from claw_telegram.backends.base import BackendError, TextDelta  # noqa: E402
+from claw_telegram.backends.echo import EchoBackend  # noqa: E402
+
+
+class Down(Backend):
+    name = "down"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def stream(self, turn):
+        self.calls += 1
+        raise BackendError("down: cannot reach http://127.0.0.1:9 (ClientConnectorError)")
+        yield
+
+    async def health(self):
+        return "unreachable (ClientConnectorError)"
+
+
+class Flaky(Backend):
+    name = "flaky"
+
+    async def stream(self, turn):
+        yield TextDelta("partial answer")
+        raise BackendError("flaky: connection reset")
+
+
+async def test_falls_back_in_order_and_opens_the_circuit():
+    down = Down()
+    backends = {"down": down, "down2": Down(), "echo": EchoBackend()}
+    async with harness(backends=backends, default_backend="down", fallback_backends=("down2", "echo"),
+                       circuit_failures=2) as h:
+        for text in ["one", "two", "three"]:
+            h.fake.push_message(OWNER, text)
+            await h.pump()
+        first = h.fake.sent(OWNER)[0]
+        assert first["text"].startswith("echo: one")
+        assert first["text"].endswith("<i>↪️ answered by echo; down, down2 failed</i>")
+        assert first["edits"] >= 3  # showed "⏳ down failed (...); trying down2" on the way
+        assert down.calls == 2  # circuit opened after two failures, third turn skipped it
+        assert h.fake.texts(OWNER)[2].startswith("echo: three")
+        assert h.bot.health.breakers["down"].state == "open"
+        assert "(history: 4 msgs)" in h.fake.texts(OWNER)[2]  # the note isn't stored in history
+
+
+async def test_no_failover_after_output_was_shown():
+    async with harness(backends={"flaky": Flaky(), "echo": EchoBackend()}, default_backend="flaky",
+                       fallback_backends=("echo",)) as h:
+        h.fake.push_message(OWNER, "hi")
+        await h.pump()
+        assert h.fake.texts(OWNER) == ["⚠️ flaky: connection reset"]
+
+
+async def test_all_failed_lists_every_error_and_role_limits_fallbacks():
+    backends = {"down": Down(), "down2": Down(), "echo": EchoBackend()}
+    async with harness(backends=backends, default_backend="down", fallback_backends=("down2", "echo"),
+                       owner_ids=frozenset({1}), allowed_user_ids=frozenset({OWNER}),
+                       role_backends={"user": frozenset({"down", "down2"})}) as h:
+        h.fake.push_message(OWNER, "hi")
+        await h.pump()
+        (text,) = h.fake.texts(OWNER)
+        assert text.splitlines() == ["⚠️ All backends failed:",
+                                     "• down: down: cannot reach http://127.0.0.1:9 (ClientConnectorError)",
+                                     "• down2: down: cannot reach http://127.0.0.1:9 (ClientConnectorError)"]

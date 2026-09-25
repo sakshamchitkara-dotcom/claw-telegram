@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
 from .config import ROLES, Settings
+from .failover import Health
 from .formatting import render, split_plain
 from .ratelimit import RateLimiter
 from .schedule import next_run, parse_when, split_spec
@@ -83,6 +84,7 @@ class Bot:
         self.tz = ZoneInfo(settings.timezone) if settings.timezone else datetime.now().astimezone().tzinfo
         self._sched_wake = asyncio.Event()
         self.me: dict = {"id": 0, "username": ""}  # filled by init()
+        self.health = Health(backends, settings.circuit_failures, settings.circuit_cooldown_s)
         self._busy: dict[tuple[int, int], str] = {}  # (chat, topic) -> backend name of the in-flight turn
         self._tasks: set[asyncio.Task] = set()
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
@@ -238,61 +240,88 @@ class Bot:
             return
         name = self.backend_name(*ctx.key)
         if not self.s.backend_allowed(ctx.role, name):
-            await self.reply(ctx, f"Your role ({ctx.role}) can't use the {name} backend. "
-                                                "Pick another with /backend.")
+            await self.reply(ctx, f"Your role ({ctx.role}) can't use the {name} backend. Pick another with /backend.")
             return
         self._busy[ctx.key] = name
         turn = Turn(chat_id=ctx.chat_id, session_id=self.store.session_id(*ctx.key), text=text,
                     history=self.store.history(ctx.chat_id, self.s.history_limit, ctx.thread_id), images=images,
                     thread_id=ctx.thread_id)
-        self.spawn(self._run_turn(name, turn))
+        self.spawn(self._run_turn(self.chain(name, ctx.role, bool(images)), turn))
 
     def backend_name(self, chat_id: int, thread: int = 0) -> str:
         name = self.store.backend_for(chat_id, thread)
         return name if name in self.backends else self.s.default_backend
 
-    async def _run_turn(self, name: str, turn: Turn) -> None:
+    def chain(self, name: str, role: str, images: bool = False) -> list[str]:
+        """The chat's backend, then FALLBACK_BACKENDS the role may use, minus open circuits."""
+        names = [name] + [n for n in self.s.fallback_backends if n != name and self.s.backend_allowed(role, n)
+                          and (not images or self.backends[n].supports_images)]
+        up = [n for n in names if self.health.breakers[n].available()]
+        return up or names[:1]  # everything is down: still try the chat's own backend
+
+    async def _run_turn(self, names: list[str], turn: Turn) -> None:
         try:
-            await self._stream_turn(name, turn)
+            await self._stream_turn(names, turn)
         finally:
             self._busy.pop((turn.chat_id, turn.thread_id), None)
 
-    async def _stream_turn(self, name: str, turn: Turn) -> None:
+    async def _stream_turn(self, names: list[str], turn: Turn) -> None:
         chat_id = turn.chat_id
-        backend = self.backends[name]
         await self.tg.send_chat_action(chat_id, thread_id=turn.thread_id)
         placeholder = await self.tg.send_message(chat_id, "…", thread_id=turn.thread_id)
         mid = placeholder["message_id"]
-        text, status, last_edit, shown = "", "", 0.0, "…"
-        try:
-            async for ev in backend.stream(turn):
-                if isinstance(ev, TextDelta):
-                    text += ev.text
-                    status = ""
-                elif isinstance(ev, Status):
-                    status = ev.text
-                else:
-                    await self._on_backend_event(name, turn, ev)
-                    continue
-                now = time.monotonic()
-                if now - last_edit >= self.s.stream_edit_interval_s:
-                    live = text if len(text) <= LIVE_LIMIT else "…" + text[-LIVE_LIMIT:]
-                    live = (live + (f"\n\n⏳ {status}" if status else "")).strip() or "…"
-                    if live != shown:
-                        await self._safe_edit(chat_id, mid, live)
-                        shown, last_edit = live, now
-        except BackendError as e:
-            log.warning("backend %s failed: %s", name, e)
-            await self._safe_edit(chat_id, mid, f"⚠️ {e}")
-            return
-        except Exception:
-            log.exception("turn failed in chat %s", chat_id)
-            await self._safe_edit(chat_id, mid, "⚠️ Internal error, see bot logs.")
-            return
+        failed: list[tuple[str, BackendError]] = []
+        for i, name in enumerate(names):
+            self._busy[(chat_id, turn.thread_id)] = name
+            committed: list[bool] = []  # set once the user has seen output or an approval
+            try:
+                text = await self._stream_backend(name, turn, mid, committed)
+            except BackendError as e:
+                log.warning("backend %s failed: %s", name, e)
+                self.health.breakers[name].failure(str(e))
+                failed.append((name, e))
+                if committed or i == len(names) - 1:  # can't retry output the user already saw
+                    msg = f"⚠️ {e}" if len(failed) == 1 else "⚠️ All backends failed:\n" + "\n".join(
+                        f"• {n}: {err}" for n, err in failed)
+                    await self._safe_edit(chat_id, mid, msg)
+                    return
+                await self._safe_edit(chat_id, mid, f"⏳ {name} failed ({e}); trying {names[i + 1]}")
+                continue
+            except Exception:
+                log.exception("turn failed in chat %s", chat_id)
+                await self._safe_edit(chat_id, mid, "⚠️ Internal error, see bot logs.")
+                return
+            self.health.breakers[name].success()
+            break
         text = text.strip() or "(empty reply)"
         self.store.add_message(chat_id, "user", turn.text, turn.thread_id)
         self.store.add_message(chat_id, "assistant", text, turn.thread_id)
+        if failed:  # shown, not stored: it isn't part of the conversation
+            text += f"\n\n*↪️ answered by {name}; {', '.join(n for n, _ in failed)} failed*"
         await self._deliver(chat_id, mid, text, turn.thread_id)
+
+    async def _stream_backend(self, name: str, turn: Turn, mid: int, committed: list[bool]) -> str:
+        """Stream one backend's reply into the placeholder message and return the full text."""
+        text, status, last_edit, shown = "", "", 0.0, ""
+        async for ev in self.backends[name].stream(turn):
+            if isinstance(ev, TextDelta):
+                text += ev.text
+                status = ""
+                committed.append(True)
+            elif isinstance(ev, Status):
+                status = ev.text
+            else:
+                committed.append(True)
+                await self._on_backend_event(name, turn, ev)
+                continue
+            now = time.monotonic()
+            if now - last_edit >= self.s.stream_edit_interval_s:
+                live = text if len(text) <= LIVE_LIMIT else "…" + text[-LIVE_LIMIT:]
+                live = (live + (f"\n\n⏳ {status}" if status else "")).strip() or "…"
+                if live != shown:
+                    await self._safe_edit(turn.chat_id, mid, live)
+                    shown, last_edit = live, now
+        return text
 
     async def _on_backend_event(self, name: str, turn: Turn, ev) -> None:
         if isinstance(ev, ApprovalRequest):
