@@ -64,3 +64,25 @@ async def test_runtime_added_user_is_allowed():
         await h.pump()
         denied, reply = h.fake.texts(4001)
         assert denied.startswith("Not authorized") and reply.startswith("echo: hi")
+
+
+async def test_users_command_permissions_and_audit():
+    async with harness(**roles()) as h:
+        async def say(uid, text):
+            h.fake.push_message(uid, text)
+            await h.pump()
+            return h.fake.texts(uid)[-1]
+
+        assert await say(USER, "/users") == "Only admins can manage users."
+        assert await say(ADMIN, "/users add 5000 admin") == "Only owners can add admins."
+        assert await say(ADMIN, "/users add 5000") == "Added 5000 as user."
+        assert await say(ADMIN, f"/users remove {OWNER}") == (
+            f"{OWNER} is set in the environment (owner); change it there.")
+        assert await say(OWNER, "/users add 6000 admin") == "Added 6000 as admin."
+        assert await say(ADMIN, "/users remove 6000") == "Only owners can remove admins."
+        assert await say(6000, "/users remove 5000") == "Removed 5000."
+        assert (await say(OWNER, "/users bogus")).startswith("Usage:")
+        listing = await say(OWNER, "/users")
+        assert f"owner: {OWNER}" in listing and f"admin: {ADMIN}" in listing and "6000 (admin, added by" in listing
+        assert "5000" not in listing
+        assert [e.action for e in h.bot.store.audit_log()] == ["user.remove", "user.add", "user.add"]

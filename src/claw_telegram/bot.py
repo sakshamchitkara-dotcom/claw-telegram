@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 
 from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
-from .config import Settings
+from .config import ROLES, Settings
 from .formatting import render, split_plain
 from .ratelimit import RateLimiter
 from .store import Store
@@ -25,6 +25,7 @@ COMMANDS = [
     ("backend", "Show or switch the agent backend"),
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
+    ("users", "Admins: list, add or remove users"),
 ]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TEXT_DOC_BYTES = 200 * 1024
@@ -426,3 +427,57 @@ class Bot:
             return
         lines = [f"#{t.id} [{t.status}] {t.backend}: {t.summary.splitlines()[0][:80]}" for t in tasks]
         await self.tg.send_message(chat_id, "\n".join(lines))
+
+    def _at_least(self, ctx: Ctx, role: str) -> bool:
+        return ROLES.index(ctx.role) <= ROLES.index(role)
+
+    async def cmd_users(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
+        if not self._at_least(ctx, "admin"):
+            await self.tg.send_message(chat_id, "Only admins can manage users.")
+            return
+        action, *rest = arg.split() or ["list"]
+        if action == "list":
+            s = self.s
+            env = [f"{r}: {', '.join(map(str, sorted(ids)))}" for r, ids in
+                   (("owner", s.owners), ("admin", s.admin_ids),
+                    ("user", s.allowed_user_ids if s.owner_ids else frozenset())) if ids]
+            added = [f"{uid} ({role}, added by {by})" for uid, role, by in self.store.list_users()]
+            text = "From environment:\n" + ("\n".join(env) or "(none)")
+            text += "\n\nAdded with /users:\n" + ("\n".join(added) or "(none)")
+            text += "\n\n/users add <id> [user|admin] · /users remove <id>"
+            await self.tg.send_message(chat_id, text)
+            return
+        if action not in {"add", "remove"} or not rest or not rest[0].lstrip("-").isdigit():
+            await self.tg.send_message(chat_id, "Usage: /users [list] | add <id> [user|admin] | remove <id>")
+            return
+        uid = int(rest[0])
+        if self.s.env_role(uid):
+            await self.tg.send_message(chat_id, f"{uid} is set in the environment ({self.s.env_role(uid)}); "
+                                                "change it there.")
+            return
+        if action == "add":
+            role = rest[1] if len(rest) > 1 else "user"
+            if role not in {"user", "admin"}:
+                await self.tg.send_message(chat_id, "Role must be user or admin.")
+                return
+            if role == "admin" and ctx.role != "owner":
+                await self.tg.send_message(chat_id, "Only owners can add admins.")
+                return
+            if self.store.user_role(uid) == "admin" and ctx.role != "owner":
+                await self.tg.send_message(chat_id, "Only owners can change an admin.")
+                return
+            self.store.set_user(uid, role, ctx.user_id)
+            self.store.audit("user.add", user_id=ctx.user_id, chat_id=chat_id, detail=f"{uid} as {role}")
+            await self.tg.send_message(chat_id, f"Added {uid} as {role}.")
+            return
+        current = self.store.user_role(uid)
+        if current is None:
+            await self.tg.send_message(chat_id, f"{uid} is not a runtime user.")
+            return
+        if current == "admin" and ctx.role != "owner":
+            await self.tg.send_message(chat_id, "Only owners can remove admins.")
+            return
+        self.store.remove_user(uid)
+        self.store.audit("user.remove", user_id=ctx.user_id, chat_id=chat_id, detail=f"{uid} ({current})")
+        await self.tg.send_message(chat_id, f"Removed {uid}.")
