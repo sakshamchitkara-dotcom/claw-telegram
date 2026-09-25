@@ -3,6 +3,34 @@
 All notable changes to this project. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-09-25
+
+### Added
+
+- `FIRST_TOKEN_TIMEOUT_S` (default 180) and `IDLE_TIMEOUT_S` (default 300): a backend that accepts a request
+  and then goes silent fails, so the turn falls over instead of waiting for the 600 s HTTP timeout. The clock
+  stops while an approval prompt is open in the chat.
+- `/cancel` stops the reply running in the chat and denies the approval it was waiting on, if any.
+- `/summarize` asks the backend for a summary and replaces the stored history with it (stateless backends).
+- Daily reply quotas per role (`DAILY_TURNS_<ROLE>`) and `/usage` (`/usage all` for admins), backed by a new
+  `usage` table (schema migration 2).
+- Read-only admin page at `/admin` behind `ADMIN_PASSWORD` (HTTP Basic auth): backends and circuits, running
+  replies, pending approvals, today's usage and the audit log.
+- OpenAI-compatible reasoning models (`delta.reasoning` / `reasoning_content`) show `⏳ thinking…`.
+
+### Fixed
+
+- A half-open circuit lets exactly one trial turn through; concurrent turns use their fallbacks.
+- A turn waiting on an out-of-band (OpenClaw) approval is never retried on a fallback backend.
+- Without `TIMEZONE` the host's IANA zone is used, so DST changes no longer need a restart. `/remind 3h`
+  and `/every 3h` are real elapsed time across DST, and a cron time in the repeated hour runs once.
+- `TZ=:/etc/localtime` and other libc-style `TZ` values no longer crash startup; a bad `TIMEZONE` stops the
+  bot with a clear message.
+- Chats are handled concurrently in polling mode (a slow voice note no longer blocks other chats), and each
+  chat's updates stay in order in both modes.
+- Shutdown marks interrupted replies and denies open approvals instead of leaving "…" and live buttons.
+  Approvals left pending by a crash are denied at the next start.
+
 ## [0.2.0] - 2026-09-25
 
 ### Added
@@ -63,5 +91,6 @@ Streaming replies, Approve/Deny for agent actions (OpenClaw exec approvals over 
 run approvals), photos/documents/voice notes, per-chat sqlite memory, allowlist auth, rate limiting, polling
 and webhook modes, Docker and systemd deployment.
 
+[0.3.0]: https://github.com/sakshamchitkara-dotcom/claw-telegram/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sakshamchitkara-dotcom/claw-telegram/compare/52eef20...v0.2.0
 [0.1.0]: https://github.com/sakshamchitkara-dotcom/claw-telegram/tree/52eef20

@@ -31,11 +31,12 @@ Telegram ──► claw-telegram ──► OpenClaw gateway  (/v1/chat/completio
 | Memory | Per-chat (and per-topic) history in SQLite. Stateful backends (OpenClaw) get only the newest turn plus a stable session id. `/reset` clears history and rotates the session. `/export` and `/import` move a conversation as JSON. |
 | Failover | Ordered `FALLBACK_BACKENDS`, per-backend circuit breakers, and background health probes. `/backend` shows health, circuit state and the order the next turn will try. |
 | Schedules | `/remind 10m text` and `/every <cron> <prompt>` (a backend prompt run on a schedule, with the answer posted to the chat). Stored in sqlite, so they survive restarts. |
-| Commands | `/start` `/help` `/reset` `/backend [name]` `/status` `/tasks` `/remind` `/every` `/schedules` `/unschedule` `/export` `/import` `/users` `/audit` |
+| Commands | `/start` `/help` `/reset` `/summarize` `/backend [name]` `/status` `/tasks` `/cancel` `/usage` `/remind` `/every` `/schedules` `/unschedule` `/export` `/import` `/users` `/audit` |
+| Limits | Optional daily reply quota per role (`DAILY_TURNS_USER=50`); `/usage` shows where you stand. `/summarize` condenses a long chat into a summary the conversation continues from. |
 | Streaming | Throttled `editMessageText` while tokens arrive, with a `⏳ tool` status line. The final reply is re-rendered as Telegram HTML from a safe Markdown subset (code fences, inline code, bold, italic, strike, headings, http(s) links). Replies longer than one message are paged in place with **Show more** buttons, without breaking code blocks. Very long ones arrive as a `.md` file. Falls back to plain text if Telegram rejects the markup. |
 | Media | Photos and image documents go to backends that accept images (data-URL `image_url` parts / Claude image blocks). Small text files are inlined. Voice notes are transcribed through any OpenAI-compatible `/audio/transcriptions` endpoint. |
 | Agent actions | Backend approval requests become persisted tasks with an inline keyboard. Each can be answered once, only by a role that is allowed to approve, and is **denied automatically** after `APPROVAL_TIMEOUT_S`. Every decision goes to an audit table: `/tasks` shows the chat's tasks and `/audit` shows the full log. |
-| Ops | Per-user rate limit, one in-flight turn per chat, `/healthz`, Dockerfile, docker-compose (with optional Ollama and Hermes Agent), hardened systemd unit, CI. |
+| Ops | Per-user rate limit, one in-flight turn per chat (`/cancel` stops it), chats handled concurrently, `/healthz`, optional password-protected read-only `/admin` page, clean shutdown, Dockerfile, docker-compose (with optional Ollama and Hermes Agent), hardened systemd unit, CI. |
 
 ## Quick start
 
@@ -77,8 +78,15 @@ DEFAULT_BACKEND=openclaw
 FALLBACK_BACKENDS=hermes,openai   # tried in this order
 HEALTH_INTERVAL_S=60              # background probes; a failed probe opens the circuit
 CIRCUIT_FAILURES=3                # consecutive turn failures that open it
-CIRCUIT_COOLDOWN_S=60             # then one trial turn is let through
+CIRCUIT_COOLDOWN_S=60             # then exactly one trial turn is let through
+FIRST_TOKEN_TIMEOUT_S=180         # silent this long before the first event = failed
+IDLE_TIMEOUT_S=300                # silent this long between events = failed
 ```
+
+A backend that accepts the request and then says nothing fails after `FIRST_TOKEN_TIMEOUT_S`, so the turn
+falls over instead of hanging. The clock stops while an approval prompt is open in the chat. Reasoning models
+on Ollama/vLLM show `⏳ thinking…` while they think, which also counts as activity. `/cancel` stops a
+reply at any time.
 
 A turn falls back only if the backend fails **before** the user has seen output or an approval prompt, so a
 half-streamed answer or a pending action is never run twice. The reply is labelled with the backend that
@@ -96,7 +104,9 @@ that don't take images when the turn has a photo.
 /schedules            /unschedule 3
 ```
 
-Times use `TIMEZONE` (IANA name, default: the host's local time). `/every` runs the prompt through the chat's
+Times use `TIMEZONE` (IANA name). Without it the host's zone is read from `/etc/localtime`, so DST changes
+are followed without a restart. Durations (`/remind 3h`) are real elapsed time, a cron time in the hour
+that DST skips runs just after the jump, and one in the repeated hour runs once. `/every` runs the prompt through the chat's
 backend. Approval prompts from that run work as usual. Plain users can have up to `MAX_SCHEDULES_PER_USER`.
 
 ### Backends
@@ -116,6 +126,9 @@ backend. Approval prompts from that run work as usual. Plain users can have up t
 - **Docker:** `docker compose up -d`. Add `--profile ollama` or `--profile hermes` to run a backend next to
   the bot on a private compose network. See the comments in `docker-compose.yml`.
 - **systemd:** `deploy/claw-telegram.service` (instructions at the top of the file).
+- **Admin page:** set `ADMIN_PASSWORD` (16+ chars) and open `http://HOST:HTTP_PORT/admin` (HTTP Basic auth,
+  any user name). It is read-only: backends and circuits, running replies, pending approvals, today's usage
+  and the audit log. Put it behind TLS if the port is reachable from outside.
 - **Webhook:** set `BOT_MODE=webhook`, `WEBHOOK_URL=https://your.host` and a random `WEBHOOK_SECRET`
   (16-256 chars of `A-Za-z0-9_-`, e.g. `openssl rand -hex 32`), and route `https://your.host/telegram/webhook`
   to `HTTP_PORT` through a TLS proxy. Add `WEBHOOK_IP_ALLOWLIST=telegram` to accept only Telegram's published
@@ -170,7 +183,7 @@ Checked against the upstream docs **and** against live local installs (OpenClaw 
 
 ```bash
 pip install -e '.[claude,dev]'
-ruff check src tests scripts && pytest -q          # 109 tests, no network needed
+ruff check src tests scripts && pytest -q          # 133 tests, no network needed
 python scripts/e2e_fake_telegram.py               # real bot process <-> fake Telegram <-> mock backend
 python scripts/e2e_fake_telegram.py --backend openai \
   --env OPENAI_BASE_URL=http://localhost:11434/v1 --env OPENAI_MODEL=hermes3:3b
@@ -285,18 +298,62 @@ owner 4242: /audit
 document sent: conversation-4242-20260925-093146.json (8 messages. Restore with /import.) -> 8 messages
 ```
 
+Fake Telegram, 0.3.0 parts of `scripts/e2e_fake_telegram.py` (the `openai` backend here is an in-process
+server that accepts the request and never answers; `FIRST_TOKEN_TIMEOUT_S=3`):
+
+```
+owner 4242: Are you there?
+WARNING claw_telegram.bot: backend openai failed: openai: no response for 3s
+  bot (HTML, 3 edits): echo: Are you there?
+       (history: 4 msgs)
+       <i>↪️ answered by echo; openai failed</i>
+owner 4242: /backend
+  bot: Backends (• = this chat):
+         echo: ok [closed]
+       • openai: ok (1 models, hung present) [closed, 1 failure]
+       Next turn tries: openai → echo
+owner 4242: Take your time with this one
+owner 4242: /cancel
+  bot (None, 1 edits): ⏹ Cancelled by 4242.
+owner 4242: /summarize
+  bot (HTML, 2 edits): echo: Summarize our conversation so far ... (history: 8 msgs)
+       <i>🗜 This summary replaced 8 stored messages.</i>
+owner 4242: /usage
+  bot: Today: 6 replies (4,274 chars in, 4,407 out)
+       Last 7 days: 6 replies (4,274 chars in, 4,407 out)
+       Daily limit for your role (owner): none
+GET /admin (no password) -> 401
+GET /admin -> 200; backends: echo: ok [closed]; openai: ok (1 models, hung present) [closed, 1 failure]
+```
+
+Live Ollama `hermes3:3b` over the OpenAI-compatible API (0.3.0, fake Telegram):
+
+```
+owner 4242: My cat is called Miso. Reply with just: ok
+  bot (HTML, 3 edits): ok, I see you have a lovely cat named Miso.İs
+owner 4242: What is my cat called? One word.
+  bot (HTML, 2 edits): ok, your cat is called Miso.
+owner 4242: /summarize
+  bot (HTML, 2 edits): - Cat name: Miso
+       <i>🗜 This summary replaced 4 stored messages.</i>
+owner 4242: /usage
+  bot: Today: 3 replies (271 chars in, 89 out)
+GET /admin -> 200; backends: echo: ok [closed]; openai: ok (4 models, hermes3:3b present) [closed]
+```
+
 (Answer quality in these runs comes from the small local models: `ping` for "pong" is what `hermes3:3b`
 actually said. The bot passes model output through unchanged.)
 
 ## Limitations
 
 - Plugin approvals (`plugin.approval.*`) and Hermes' `session`/`always` choices are not exposed. Approve means once.
-- Updates are handled in order. A long voice transcription delays other chats' updates in polling mode.
-- A backend that hangs rather than failing (no error, no tokens) only fails over when its HTTP timeout
-  (600 s) runs out. There is no separate first-token timeout.
-- Without `TIMEZONE`, schedules use the host's UTC offset at startup, so a DST change needs a restart. Cron
-  runs in local wall-clock time, so a run inside a DST gap or overlap can move by an hour.
-- The half-open circuit state lets every concurrent turn through, not exactly one trial.
+- A backend that streams nothing the bot recognises (no content, reasoning, tool-call or vendor events) for
+  `FIRST_TOKEN_TIMEOUT_S` is treated as hung, even if it is busy. Raise the timeouts for slow agents.
+- `/summarize` can't compact a stateful backend's (OpenClaw's) server-side transcript; there it only shows
+  the summary.
+- Quotas count replies, not tokens; the character counts in `/usage` are an approximation of cost.
+- If the host has no zone name (no `/etc/localtime` link or `/etc/timezone`) and `TIMEZONE` is unset, the
+  bot falls back to a fixed UTC offset and logs a warning.
 
 ## License
 
