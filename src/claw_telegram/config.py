@@ -74,6 +74,8 @@ class Settings:
     # in webhook_trusted_proxies so the client IP is taken from X-Forwarded-For.
     webhook_ip_allowlist: tuple[Network, ...] = ()
     webhook_trusted_proxies: tuple[Network, ...] = ()
+    # Read-only status page at /admin (HTTP Basic auth, any user name). Empty = no page.
+    admin_password: str = ""
     http_host: str = "0.0.0.0"
     http_port: int = 8080
     db_path: str = "data/claw-telegram.db"
@@ -131,8 +133,12 @@ class Settings:
         if secret and not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", secret):
             # Telegram allows 1-256 of these characters; we also insist on a guess-resistant length.
             raise SystemExit("WEBHOOK_SECRET must be 16-256 characters of A-Z a-z 0-9 _ -")
+        admin_password = e.get("ADMIN_PASSWORD", "")
+        if admin_password and len(admin_password) < 16:
+            raise SystemExit("ADMIN_PASSWORD must be at least 16 characters (e.g. openssl rand -hex 16)")
         return cls(
             telegram_token=token,
+            admin_password=admin_password,
             telegram_api_base=e.get("TELEGRAM_API_BASE", cls.telegram_api_base).rstrip("/"),
             owner_ids=_ids(e.get("OWNER_IDS", "")),
             admin_ids=_ids(e.get("ADMIN_IDS", "")),

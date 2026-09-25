@@ -1,19 +1,24 @@
-"""Process wiring: long polling or webhook, plus a /healthz endpoint."""
+"""Process wiring: long polling or webhook, plus /healthz and the optional /admin page."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import collections
 import hmac
+import html
 import ipaddress
 import logging
 import time
+from datetime import datetime
 
 from aiohttp import web
 
 from .backends import build_backends
 from .bot import COMMANDS, Bot
 from .config import Settings
+from .failover import healthy
 from .store import Store
 from .telegram import Telegram, TelegramError
 from .transcribe import Transcriber
@@ -38,6 +43,55 @@ def client_ip(remote: str | None, forwarded_for: str,
         except ValueError:
             return None
     return ip
+
+
+def basic_auth_ok(header: str, password: str) -> bool:
+    """HTTP Basic credentials carry `password` (the user name is ignored). Constant-time compare."""
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        given = base64.b64decode(token, validate=True).decode().partition(":")[2]
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    return hmac.compare_digest(given.encode(), password.encode())
+
+
+def admin_page(bot: Bot, settings: Settings, stats: dict) -> str:
+    """One read-only HTML page: backends, circuits, activity, pending approvals, usage, audit log."""
+    e = html.escape
+    up = int(time.time() - bot.started)
+    rows = []
+    for name in bot.backends:
+        status = bot.health.status.get(name, "not checked yet")
+        mark = "ok" if healthy(status) else ("unknown" if name not in bot.health.status else "bad")
+        rows.append(f"<tr><td>{e(name)}</td><td class={mark}>{e(bot.health.describe(name))}</td></tr>")
+    pending = bot.store.pending_tasks()
+    tasks = "".join(f"<tr><td>#{t.id}</td><td>{t.chat_id}</td><td>{e(t.backend)}</td>"
+                    f"<td>{e(t.summary[:200])}</td></tr>" for t in pending) or "<tr><td colspan=4>none</td></tr>"
+    today = bot._today()
+    usage = "".join(f"<tr><td>{uid}</td><td>{n}</td><td>{cin:,}</td><td>{cout:,}</td></tr>"
+                    for uid, n, cin, cout in bot.store.usage_by_user(today)) or "<tr><td colspan=4>none</td></tr>"
+    audit = "".join(
+        f"<tr><td>{datetime.fromtimestamp(a.ts, bot.tz):%Y-%m-%d %H:%M:%S}</td><td>{e(a.action)}</td>"
+        f"<td>{a.user_id if a.user_id is not None else 'system'}</td><td>{a.chat_id if a.chat_id is not None else ''}"
+        f"</td><td>{e(a.detail.splitlines()[0][:160] if a.detail else '')}</td></tr>"
+        for a in bot.store.audit_log(30)) or "<tr><td colspan=5>empty</td></tr>"
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>claw-telegram admin</title>
+<style>body{{font:14px system-ui,sans-serif;margin:16px;max-width:1000px}}table{{border-collapse:collapse;width:100%;
+margin-bottom:20px}}td,th{{border-bottom:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}}
+.ok{{color:#176b2c}}.bad{{color:#b3261e}}.unknown{{color:#777}}</style></head><body>
+<h1>claw-telegram</h1>
+<p>mode {e(settings.mode)} · up {up // 3600}h{up % 3600 // 60:02d}m · {stats["updates"]} updates ·
+{len(bot._turns)} replies running · default backend {e(settings.default_backend)}
+{(" · fallbacks " + e(", ".join(settings.fallback_backends))) if settings.fallback_backends else ""}</p>
+<h2>Backends</h2><table>{"".join(rows)}</table>
+<h2>Pending approvals</h2><table><tr><th>task</th><th>chat</th><th>backend</th><th>action</th></tr>{tasks}</table>
+<h2>Usage on {e(today)}</h2><table><tr><th>user</th><th>replies</th><th>chars in</th><th>chars out</th></tr>
+{usage}</table>
+<h2>Audit log (latest 30)</h2><table><tr><th>time</th><th>action</th><th>by</th><th>chat</th><th>detail</th></tr>
+{audit}</table></body></html>"""
 
 
 def make_web_app(bot: Bot, settings: Settings) -> web.Application:
@@ -80,7 +134,17 @@ def make_web_app(bot: Bot, settings: Settings) -> web.Application:
         bot.submit(update)  # ack fast; Telegram retries slow webhooks
         return web.Response(text="ok")
 
+    async def admin(request: web.Request) -> web.Response:
+        if not basic_auth_ok(request.headers.get("Authorization", ""), settings.admin_password):
+            log.warning("admin page: bad or missing credentials from %s", request.remote)
+            return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="claw-telegram"'})
+        return web.Response(text=admin_page(bot, settings, stats), content_type="text/html",
+                            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY",
+                                     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+
     app.router.add_get("/healthz", healthz)
+    if settings.admin_password:
+        app.router.add_get("/admin", admin)
     if settings.mode == "webhook":
         app.router.add_post(WEBHOOK_PATH, webhook)
     return app

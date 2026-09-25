@@ -137,3 +137,41 @@ async def test_webhook_ip_allowlist():
                 assert r.status == 200
             await h.bot.drain()
         assert h.fake.texts(OWNER)[0].startswith("echo: hi")
+
+
+async def test_admin_page_needs_the_password_and_escapes_content():
+    import base64
+
+    pw = "a-long-admin-password"
+    async with harness(admin_password=pw, timezone="UTC") as h:
+        h.bot.store.audit("user.add", user_id=OWNER, chat_id=OWNER, detail="<script>alert(1)</script>")
+        h.fake.push_message(OWNER, "!task make <deploy>")
+        await h.pump(drain=False)
+        await asyncio.sleep(0.05)
+        app = make_web_app(h.bot, h.bot.s)
+        good = "Basic " + base64.b64encode(f"admin:{pw}".encode()).decode()
+        bad = "Basic " + base64.b64encode(b"admin:wrong").decode()
+        async with serve(app) as url, aiohttp.ClientSession() as http:
+            for auth in (None, bad, "Bearer " + pw, "Basic !!!"):
+                async with http.get(url + "/admin", headers={"Authorization": auth} if auth else {}) as r:
+                    assert r.status == 401 and r.headers["WWW-Authenticate"].startswith("Basic")
+            async with http.get(url + "/admin", headers={"Authorization": good}) as r:
+                assert r.status == 200 and r.headers["Cache-Control"] == "no-store"
+                page = await r.text()
+        assert "<td>echo</td>" in page and "1 replies running" in page
+        assert "run shell: make &lt;deploy&gt;" in page  # the pending approval
+        assert "&lt;script&gt;" in page and "<script>" not in page
+        await h.bot.shutdown(grace=1)
+
+
+async def test_admin_page_is_off_without_a_password():
+    async with harness() as h:
+        async with serve(make_web_app(h.bot, h.bot.s)) as url, aiohttp.ClientSession() as http:
+            async with http.get(url + "/admin") as r:
+                assert r.status == 404
+
+
+def test_admin_password_must_be_long():
+    import pytest
+    with pytest.raises(SystemExit, match="16 characters"):
+        Settings.from_env({"TELEGRAM_BOT_TOKEN": "t", "ADMIN_PASSWORD": "short"})
