@@ -76,3 +76,23 @@ async def test_webhook_mode_registers_with_telegram(tmp_path):
         await asyncio.wait_for(task, 10)
     assert fake.webhook["url"] == "https://bot.example.com/telegram/webhook"
     assert fake.webhook["secret_token"] == "abc"
+
+
+async def test_reminder_survives_restart(tmp_path):
+    fake = FakeTelegram()
+    async with serve(fake.app) as url:
+        s = Settings(telegram_token=fake.token, telegram_api_base=url, allowed_user_ids=frozenset({OWNER}),
+                     db_path=str(tmp_path / "bot.db"), http_host="127.0.0.1", http_port=free_port())
+        stop = asyncio.Event()
+        task = asyncio.create_task(run(s, stop))
+        fake.push_message(OWNER, "/remind 2s take the pizza out")
+        await wait_for(lambda: any(t.startswith("⏰ Reminder #1 set") for t in fake.texts(OWNER)))
+        stop.set()
+        await asyncio.wait_for(task, 10)
+        assert not any("pizza" in t for t in fake.texts(OWNER))
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(run(s, stop))  # same DB, fresh process state
+        await wait_for(lambda: "⏰ Reminder: take the pizza out" in fake.texts(OWNER))
+        stop.set()
+        await asyncio.wait_for(task, 10)

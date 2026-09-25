@@ -90,6 +90,7 @@ async def run(settings: Settings, stop: asyncio.Event | None = None) -> None:
             await tg.set_commands(COMMANDS)
         except TelegramError as e:
             log.warning("setMyCommands failed: %s", e)
+        scheduler = asyncio.create_task(bot.scheduler(), name="scheduler")
         app = make_web_app(bot, settings)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
@@ -109,6 +110,7 @@ async def run(settings: Settings, stop: asyncio.Event | None = None) -> None:
                 if not poller.cancelled() and poller.done() and poller.exception():
                     raise poller.exception()
         finally:
+            scheduler.cancel()
             await runner.cleanup()
             for b in backends.values():
                 await b.close()
