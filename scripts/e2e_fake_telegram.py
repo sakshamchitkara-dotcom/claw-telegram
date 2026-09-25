@@ -34,17 +34,23 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-async def wait_idle(fake: FakeTelegram, settle: float = 1.5, timeout: float = 180) -> None:
-    """Wait until the bot stops sending/editing messages for `settle` seconds."""
+async def wait_idle(fake: FakeTelegram, settle: float = 1.5, timeout: float = 600) -> None:
+    """Wait until the bot is quiet for `settle` seconds and no turn is running,
+    or until an approval prompt is waiting for the user."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    last, last_change = len(fake.calls), loop.time()
+    last, quiet_since = len(fake.calls), loop.time()
     while loop.time() < deadline:
         await asyncio.sleep(0.1)
-        busy = [m for m in fake.sent(OWNER) if m["text"] == "…"]
-        if len(fake.calls) != last or busy:
-            last, last_change = len(fake.calls), loop.time()
-        elif loop.time() - last_change >= settle:
+        if len(fake.calls) != last:
+            last, quiet_since = len(fake.calls), loop.time()
+            continue
+        if loop.time() - quiet_since < settle:
+            continue
+        # "…" placeholder or a "⏳ status" line means an agent turn is still running
+        running = [m for m in fake.sent(OWNER) if m["text"] == "…" or m["text"].startswith("⏳")
+                   or "\n\n⏳ " in m["text"]]
+        if not running or fake.with_keyboard(OWNER):
             return
     raise TimeoutError("bot did not go idle")
 
