@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claw-telegram"
+version = "0.1.0"
+description = "Telegram personal-assistant bot for self-hosted agent backends (OpenClaw, Hermes Agent, OpenAI-compatible, Claude)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["aiohttp>=3.9"]
+
+[project.optional-dependencies]
+claude = ["anthropic>=1.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[project.scripts]
+claw-telegram = "claw_telegram.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claw_telegram"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
