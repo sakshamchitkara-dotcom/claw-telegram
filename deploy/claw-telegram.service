@@ -1,0 +1,31 @@
+# Example systemd unit. Install:
+#   sudo useradd --system --home /var/lib/claw-telegram --create-home claw
+#   sudo python3 -m venv /opt/claw-telegram && sudo /opt/claw-telegram/bin/pip install 'claw-telegram[claude] @ git+https://github.com/sakshamchitkara-dotcom/claw-telegram'
+#   sudo install -m 600 -o claw .env /etc/claw-telegram.env
+#   sudo cp deploy/claw-telegram.service /etc/systemd/system/ && sudo systemctl enable --now claw-telegram
+[Unit]
+Description=claw-telegram Telegram assistant bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=claw
+EnvironmentFile=/etc/claw-telegram.env
+Environment=DB_PATH=/var/lib/claw-telegram/claw-telegram.db
+ExecStart=/opt/claw-telegram/bin/claw-telegram
+Restart=on-failure
+RestartSec=5
+# Hardening: the bot only needs the network and its state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/claw-telegram
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
