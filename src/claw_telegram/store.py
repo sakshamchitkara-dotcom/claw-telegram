@@ -155,6 +155,25 @@ class Store:
             msgs.pop(0)
         return msgs
 
+    def all_messages(self, chat_id: int, thread: int = 0) -> list[dict]:
+        rows = self.db.execute("SELECT role, content, created FROM messages WHERE chat_id = ? AND thread_id = ? "
+                               "ORDER BY id", (chat_id, thread)).fetchall()
+        return [{"role": r, "content": c, "created": t} for r, c, t in rows]
+
+    def replace_messages(self, chat_id: int, thread: int, msgs: list[dict]) -> None:
+        """Swap the conversation for `msgs` in one transaction; starts a new backend session."""
+        self.db.execute("BEGIN")
+        try:
+            self.reset(chat_id, thread)
+            self.db.executemany("INSERT INTO messages (chat_id, thread_id, role, content, created) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                [(chat_id, thread, m["role"], m["content"], m.get("created") or time.time())
+                                 for m in msgs])
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
     def count_messages(self, chat_id: int, thread: int = 0) -> int:
         return self.db.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND thread_id = ?",
                                (chat_id, thread)).fetchone()[0]

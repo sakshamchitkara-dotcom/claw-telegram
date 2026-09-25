@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -34,16 +35,43 @@ COMMANDS = [
     ("every", "Repeat a prompt: /every 0 9 * * * prompt, /every 2h prompt"),
     ("schedules", "List reminders and repeating prompts"),
     ("unschedule", "Cancel a reminder or repeating prompt"),
+    ("export", "Download this conversation as JSON"),
+    ("import", "Restore a conversation: send the JSON file with caption /import"),
     ("users", "Admins: list, add or remove users"),
     ("audit", "Admins: approval and user-change log"),
 ]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TEXT_DOC_BYTES = 200 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_IMPORT_MESSAGES = 10_000
+EXPORT_FORMAT = "claw-telegram/conversation"
 TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yaml", ".yml", ".toml",
                    ".ini", ".cfg", ".html", ".xml", ".sh", ".sql", ".rs", ".go", ".java", ".c", ".h", ".cpp"}
 PREVIEW_CHARS = 1500  # shown in the chat when a long reply is sent as a file
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
+
+
+def parse_export(raw: bytes) -> list[dict]:
+    """Validate an /export file and return its messages. Raises ValueError with a user-facing reason."""
+    try:
+        doc = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("invalid JSON") from None
+    if not isinstance(doc, dict) or doc.get("format") != EXPORT_FORMAT or doc.get("version") != 1:
+        raise ValueError(f"expected format {EXPORT_FORMAT!r} version 1")
+    msgs = doc.get("messages")
+    if not isinstance(msgs, list) or len(msgs) > MAX_IMPORT_MESSAGES:
+        raise ValueError(f"messages must be a list of at most {MAX_IMPORT_MESSAGES}")
+    out = []
+    for i, m in enumerate(msgs):
+        if (not isinstance(m, dict) or m.get("role") not in {"user", "assistant"}
+                or not isinstance(m.get("content"), str)):
+            raise ValueError(f"message {i} needs role user/assistant and string content")
+        created = m.get("created")
+        out.append({"role": m["role"], "content": m["content"],
+                    "created": float(created) if isinstance(created, int | float) else None})
+    return out
 
 
 def pager(pid: int, n: int, chunks: list[str]) -> dict | None:
@@ -747,3 +775,43 @@ class Bot:
             self.store.reschedule(sc.id, nxt)  # before running, so a crash can't replay it
             await self.reply(ctx, f"🔁 #{sc.id}: {sc.text[:300]}")
             await self._start_turn(ctx, sc.text, [])
+
+    # ---- export / import --------------------------------------------------------
+
+    async def cmd_export(self, ctx: Ctx, arg: str) -> None:
+        msgs = self.store.all_messages(*ctx.key)
+        if not msgs:
+            await self.reply(ctx, "Nothing to export yet.")
+            return
+        now = datetime.now(self.tz)
+        doc = {"format": EXPORT_FORMAT, "version": 1, "exported_at": now.isoformat(timespec="seconds"),
+               "chat_id": ctx.chat_id, "thread_id": ctx.thread_id, "backend": self.backend_name(*ctx.key),
+               "messages": msgs}
+        name = f"conversation-{ctx.chat_id}{f'-t{ctx.thread_id}' if ctx.thread_id else ''}-{now:%Y%m%d-%H%M%S}.json"
+        data = json.dumps(doc, ensure_ascii=False, indent=1).encode()
+        await self.tg.send_document(ctx.chat_id, name, data, caption=f"{len(msgs)} messages. Restore with /import.",
+                                    thread_id=ctx.thread_id, mime="application/json")
+
+    async def cmd_import(self, ctx: Ctx, arg: str) -> None:
+        if is_group(ctx.msg) and not self._at_least(ctx, "admin"):
+            await self.reply(ctx, "Only admins can import into a group conversation.")
+            return
+        doc = ctx.msg.get("document") or (ctx.msg.get("reply_to_message") or {}).get("document")
+        if not doc:
+            await self.reply(ctx, "Send an exported .json file with the caption /import (or reply /import to it).")
+            return
+        if doc.get("file_size", 0) > MAX_IMPORT_BYTES:
+            await self.reply(ctx, f"That file is too large (max {MAX_IMPORT_BYTES // 1024 // 1024} MB).")
+            return
+        try:
+            raw = await self.tg.download_file(doc["file_id"], MAX_IMPORT_BYTES)
+            msgs = parse_export(raw)
+        except TelegramError as e:
+            await self.reply(ctx, f"Could not download the file ({e.description}).")
+            return
+        except ValueError as e:
+            await self.reply(ctx, f"Not a conversation export: {e}")
+            return
+        self.store.replace_messages(ctx.chat_id, ctx.thread_id, msgs)
+        await self.reply(ctx, f"Imported {len(msgs)} messages; this conversation now continues from them "
+                              "(new backend session).")
