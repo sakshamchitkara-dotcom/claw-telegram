@@ -52,3 +52,23 @@ def test_split_spec_and_next_run():
     assert next_run("2h", NOW) == NOW + timedelta(hours=2)
     with pytest.raises(ValueError):
         next_run("30s", NOW)
+
+
+def test_local_zone_follows_the_host_zone_name(tmp_path):
+    from claw_telegram.schedule import local_zone
+
+    assert local_zone("Asia/Kolkata") == ZoneInfo("Asia/Kolkata")
+    link = tmp_path / "localtime"
+    link.symlink_to(tmp_path / "zoneinfo/Europe/Berlin")  # only the name matters
+    zone = local_zone(localtime=str(link), timezone_file=str(tmp_path / "missing"))
+    assert zone == TZ  # a real zone, so summer and winter get different offsets
+    assert datetime(2026, 7, 1, 12, tzinfo=zone).utcoffset() == timedelta(hours=2)
+    assert datetime(2026, 12, 1, 12, tzinfo=zone).utcoffset() == timedelta(hours=1)
+    (tmp_path / "timezone").write_text("America/New_York\n")  # Debian style
+    assert local_zone(localtime=str(tmp_path / "nope"), timezone_file=str(tmp_path / "timezone")) == ZoneInfo(
+        "America/New_York")
+    fixed = local_zone(localtime=str(tmp_path / "nope"), timezone_file=str(tmp_path / "missing"))
+    assert fixed.utcoffset(None) is not None  # last resort: today's fixed offset
+    from zoneinfo import ZoneInfoNotFoundError
+    with pytest.raises(ZoneInfoNotFoundError):
+        local_zone("Not/AZone")

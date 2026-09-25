@@ -10,14 +10,13 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
 from .config import ROLES, Settings
 from .failover import Health
 from .formatting import render, split_plain
 from .ratelimit import RateLimiter
-from .schedule import next_run, parse_when, split_spec
+from .schedule import local_zone, next_run, parse_when, split_spec
 from .store import Store
 from .telegram import Telegram, TelegramError
 from .transcribe import Transcriber, TranscriptionError
@@ -121,8 +120,7 @@ class Bot:
         self.backends = backends
         self.limiter = RateLimiter(settings.rate_limit_per_minute)
         self.started = time.time()
-        # ponytail: without TIMEZONE the host's current UTC offset is used, so DST changes need a restart.
-        self.tz = ZoneInfo(settings.timezone) if settings.timezone else datetime.now().astimezone().tzinfo
+        self.tz = local_zone(settings.timezone)
         self._sched_wake = asyncio.Event()
         self.me: dict = {"id": 0, "username": ""}  # filled by init()
         self.health = Health(backends, settings.circuit_failures, settings.circuit_cooldown_s)

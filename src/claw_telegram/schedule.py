@@ -7,8 +7,13 @@ rule that day-of-month and day-of-week are OR-ed when both are restricted.
 
 from __future__ import annotations
 
+import logging
+import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+log = logging.getLogger(__name__)
 
 _DURATION = re.compile(r"(\d+)([smhdw])")
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -17,6 +22,36 @@ _ALIASES = {"@hourly": "0 * * * *", "@daily": "0 0 * * *", "@midnight": "0 0 * *
 _MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 _DAYS = {d: i for i, d in enumerate("sun mon tue wed thu fri sat".split())}
 MIN_INTERVAL_S = 60
+
+
+def local_zone(name: str = "", localtime: str = "/etc/localtime", timezone_file: str = "/etc/timezone") -> tzinfo:
+    """TIMEZONE if given, else the host's IANA zone so DST changes are followed without a restart.
+
+    The host zone comes from the /etc/localtime symlink (Linux, macOS, Docker images) or
+    /etc/timezone (Debian). Only if neither names a zone do we fall back to today's fixed UTC offset.
+    """
+    if name:
+        return ZoneInfo(name)  # a typo should stop the bot, not silently use another zone
+    candidates = []
+    try:
+        target = os.readlink(localtime)  # e.g. /usr/share/zoneinfo/Europe/Berlin
+        if "zoneinfo/" in target:
+            candidates.append(target.split("zoneinfo/", 1)[1])
+    except OSError:
+        pass
+    try:
+        with open(timezone_file) as f:
+            candidates.append(f.read().strip())
+    except OSError:
+        pass
+    for candidate in candidates:
+        try:
+            return ZoneInfo(candidate)
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+    fixed = datetime.now().astimezone().tzinfo
+    log.warning("can't tell the host's time zone; using a fixed %s. Set TIMEZONE to follow DST.", fixed)
+    return fixed
 
 
 def parse_duration(text: str) -> timedelta | None:
