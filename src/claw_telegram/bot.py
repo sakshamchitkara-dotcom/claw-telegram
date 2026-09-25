@@ -479,9 +479,13 @@ class Bot:
         current = self.backend_name(*ctx.key)
         usable = [n for n in self.backends if self.s.backend_allowed(ctx.role, n)]
         if not arg:
-            lines = [("• " if n == current else "  ") + n for n in usable]
-            await self.reply(ctx, "Backends (• = active):\n" + "\n".join(lines)
-                                       + "\n\nSwitch with /backend <name>.")
+            await asyncio.gather(*(self.health.check(n) for n in usable))
+            lines = [("• " if n == current else "  ") + f"{n}: {self.health.describe(n)}" for n in usable]
+            order = self.chain(current, ctx.role)
+            text = "Backends (• = this chat):\n" + "\n".join(lines)
+            if len(order) > 1 or self.s.fallback_backends:
+                text += "\n\nNext turn tries: " + " → ".join(order)
+            await self.reply(ctx, text + "\n\nSwitch with /backend <name>.")
             return
         if arg not in usable:
             await self.reply(ctx, f"Unknown backend {arg!r}. Available: {', '.join(usable)}")
@@ -491,10 +495,7 @@ class Bot:
 
     async def cmd_status(self, ctx: Ctx, arg: str) -> None:
         name = self.backend_name(*ctx.key)
-        try:
-            health = await asyncio.wait_for(self.backends[name].health(), timeout=8)
-        except asyncio.TimeoutError:
-            health = "timeout"
+        health = await self.health.check(name)
         up = int(time.time() - self.started)
         await self.reply(ctx, "\n".join([
             f"backend: {name} ({health})",

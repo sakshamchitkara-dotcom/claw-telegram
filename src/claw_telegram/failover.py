@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 
 from .backends.base import Backend
@@ -55,7 +56,7 @@ class Breaker:
             self.opened_at = self.clock()
 
     def retry_in(self) -> int:
-        return max(0, int(self.cooldown - (self.clock() - self.opened_at))) if self.opened_at is not None else 0
+        return max(0, math.ceil(self.cooldown - (self.clock() - self.opened_at))) if self.opened_at is not None else 0
 
 
 class Health:

@@ -127,3 +127,19 @@ async def test_all_failed_lists_every_error_and_role_limits_fallbacks():
         assert text.splitlines() == ["⚠️ All backends failed:",
                                      "• down: down: cannot reach http://127.0.0.1:9 (ClientConnectorError)",
                                      "• down2: down: cannot reach http://127.0.0.1:9 (ClientConnectorError)"]
+
+
+async def test_backend_command_shows_health_circuits_and_order():
+    async with harness(backends={"down": Down(), "echo": EchoBackend()}, default_backend="down",
+                       fallback_backends=("echo",)) as h:
+        h.fake.push_message(OWNER, "/backend")
+        await h.pump()
+        assert h.fake.texts(OWNER)[0].splitlines() == [
+            "Backends (• = this chat):",
+            "• down: unreachable (ClientConnectorError) [open, retry in 60s, 1 failure]",
+            "  echo: ok [closed]",
+            "",
+            "Next turn tries: echo",  # down's circuit is open
+            "",
+            "Switch with /backend <name>.",
+        ]
