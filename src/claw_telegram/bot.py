@@ -654,7 +654,7 @@ class Bot:
             where = f" task #{e.task_id}" if e.task_id else ""
             where += f" chat {e.chat_id}" if e.chat_id is not None else ""
             first = e.detail.splitlines()[0][:120] if e.detail else ""
-            lines.append(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.ts))} {e.action} by {who}{where}"
+            lines.append(f"{datetime.fromtimestamp(e.ts, self.tz):%Y-%m-%d %H:%M:%S} {e.action} by {who}{where}"
                          + (f": {first}" if first else ""))
         for chunk in split_plain("\n".join(lines)):
             await self.reply(ctx, chunk)
