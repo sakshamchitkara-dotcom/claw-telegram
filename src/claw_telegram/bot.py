@@ -13,6 +13,7 @@ from .formatting import render, split_plain
 from .ratelimit import RateLimiter
 from .store import Store
 from .telegram import Telegram, TelegramError
+from .transcribe import Transcriber, TranscriptionError
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ COMMANDS = [
 ]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TEXT_DOC_BYTES = 200 * 1024
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
 TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yaml", ".yml", ".toml",
                    ".ini", ".cfg", ".html", ".xml", ".sh", ".sql", ".rs", ".go", ".java", ".c", ".h", ".cpp"}
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
@@ -39,8 +41,10 @@ def is_text_document(name: str, mime: str | None) -> bool:
 
 
 class Bot:
-    def __init__(self, settings: Settings, tg: Telegram, store: Store, backends: dict[str, Backend]):
+    def __init__(self, settings: Settings, tg: Telegram, store: Store, backends: dict[str, Backend],
+                 transcriber: Transcriber | None = None):
         self.s = settings
+        self.transcriber = transcriber
         self.tg = tg
         self.store = store
         self.backends = backends
@@ -115,7 +119,21 @@ class Bot:
         backend = self.backends[self.backend_name(chat_id)]
         images: list[Image] = []
         doc = msg.get("document")
-        if msg.get("photo") or (doc and (doc.get("mime_type") or "").startswith("image/")):
+        voice = msg.get("voice") or msg.get("audio")
+        if voice:
+            if self.transcriber is None:
+                return text, [], "Voice notes need a transcription endpoint (set TRANSCRIBE_URL)."
+            audio = await self.tg.download_file(voice["file_id"], MAX_AUDIO_BYTES)
+            await self.tg.send_chat_action(chat_id, "typing")
+            try:
+                heard = await self.transcriber(audio, voice.get("file_name") or "voice.ogg")
+            except TranscriptionError as e:
+                return text, [], f"Transcription failed: {e}"
+            if not heard:
+                return text, [], "I couldn't hear anything in that voice note."
+            await self.tg.send_message(chat_id, f"🎙 {heard[:4000]}")
+            text = f"{text}\n\n{heard}".strip()
+        elif msg.get("photo") or (doc and (doc.get("mime_type") or "").startswith("image/")):
             if not backend.supports_images:
                 return text, [], f"The {backend.name} backend does not accept images."
             if msg.get("photo"):
