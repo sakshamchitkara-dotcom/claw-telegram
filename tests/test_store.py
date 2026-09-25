@@ -87,3 +87,15 @@ def test_migrates_a_0_1_database(tmp_path):
     assert s.history(1, 10) == [{"role": "user", "content": "kept"}]
     assert s.backend_for(1) == "hermes" and s.session_id(1) == "telegram-1-3"
     Store(path)  # reopening is a no-op
+
+
+def test_usage_counts_per_user_and_day():
+    s = Store(":memory:")
+    assert s.usage(1, "2026-09-25") == (0, 0, 0)
+    s.add_usage(1, "2026-09-24", 10, 100)
+    s.add_usage(1, "2026-09-25", 5, 50)
+    s.add_usage(1, "2026-09-25", 7, 70)
+    s.add_usage(2, "2026-09-25", 1, 1)
+    assert s.usage(1, "2026-09-25", "2026-09-25") == (2, 12, 120)
+    assert s.usage(1, "2026-09-19") == (3, 22, 220)
+    assert s.usage_by_user("2026-09-25") == [(1, 2, 12, 120), (2, 1, 1, 1)]

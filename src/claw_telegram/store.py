@@ -92,6 +92,17 @@ MIGRATIONS = [
     DROP TABLE chats;
     ALTER TABLE chats_new RENAME TO chats;
     """,
+    # 2: per-user, per-day usage counters for quotas and /usage
+    """
+    CREATE TABLE usage (
+        user_id INTEGER NOT NULL,
+        day TEXT NOT NULL,  -- YYYY-MM-DD in the bot's TIMEZONE
+        turns INTEGER NOT NULL DEFAULT 0,
+        chars_in INTEGER NOT NULL DEFAULT 0,
+        chars_out INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day)
+    );
+    """,
 ]
 
 
@@ -298,6 +309,25 @@ class Store:
 
     def delete_schedule(self, sid: int) -> bool:
         return self.db.execute("DELETE FROM schedules WHERE id = ?", (sid,)).rowcount == 1
+
+    # ---- usage counters ----------------------------------------------------------
+
+    def add_usage(self, user_id: int, day: str, chars_in: int, chars_out: int) -> None:
+        self.db.execute("INSERT INTO usage (user_id, day, turns, chars_in, chars_out) VALUES (?, ?, 1, ?, ?) "
+                        "ON CONFLICT(user_id, day) DO UPDATE SET turns = turns + 1, "
+                        "chars_in = chars_in + excluded.chars_in, chars_out = chars_out + excluded.chars_out",
+                        (user_id, day, chars_in, chars_out))
+
+    def usage(self, user_id: int, since: str, until: str = "9999-12-31") -> tuple[int, int, int]:
+        """(turns, chars in, chars out) for one user over days since..until (inclusive, YYYY-MM-DD)."""
+        return self.db.execute("SELECT COALESCE(SUM(turns), 0), COALESCE(SUM(chars_in), 0), "
+                               "COALESCE(SUM(chars_out), 0) FROM usage WHERE user_id = ? AND day BETWEEN ? AND ?",
+                               (user_id, since, until)).fetchone()
+
+    def usage_by_user(self, day: str) -> list[tuple[int, int, int, int]]:
+        """[(user_id, turns, chars in, chars out)] for one day, busiest first."""
+        return self.db.execute("SELECT user_id, turns, chars_in, chars_out FROM usage WHERE day = ? "
+                               "ORDER BY turns DESC, user_id", (day,)).fetchall()
 
     # ---- paginated long replies ------------------------------------------------
 
