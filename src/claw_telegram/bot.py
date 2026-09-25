@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,10 @@ TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", 
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
 
 
+def is_group(msg: dict) -> bool:
+    return (msg.get("chat") or {}).get("type") in {"group", "supergroup"}
+
+
 def is_text_document(name: str, mime: str | None) -> bool:
     mime = mime or ""
     if mime.startswith("text/") or mime in {"application/json", "application/xml", "application/x-yaml"}:
@@ -77,6 +82,7 @@ class Bot:
         # ponytail: without TIMEZONE the host's current UTC offset is used, so DST changes need a restart.
         self.tz = ZoneInfo(settings.timezone) if settings.timezone else datetime.now().astimezone().tzinfo
         self._sched_wake = asyncio.Event()
+        self.me: dict = {"id": 0, "username": ""}  # filled by init()
         self._busy: dict[tuple[int, int], str] = {}  # (chat, topic) -> backend name of the in-flight turn
         self._tasks: set[asyncio.Task] = set()
         self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
@@ -86,6 +92,10 @@ class Bot:
                 backend.approval_sink = lambda req, name=name: self._external_approval(name, req)
             if hasattr(backend, "resolved_sink"):  # ...and can report approvals answered elsewhere
                 backend.resolved_sink = lambda ref, decision, name=name: self._resolved_elsewhere(name, ref, decision)
+
+    async def init(self) -> None:
+        """Learn our own id and @username (needed to spot mentions and replies in groups)."""
+        self.me = await self.tg.get_me()
 
     # ---- entry point ----------------------------------------------------------
 
@@ -121,8 +131,26 @@ class Bot:
     # ---- messages ---------------------------------------------------------------
 
     async def reply(self, ctx: Ctx, text: str, **kw) -> dict:
-        """Send into the conversation (and topic) the context came from."""
+        """Send into the conversation (and topic) the context came from; in groups, as a reply."""
+        if is_group(ctx.msg) and ctx.msg.get("message_id"):
+            kw.setdefault("reply_to", ctx.msg["message_id"])
         return await self.tg.send_message(ctx.chat_id, text, thread_id=ctx.thread_id, **kw)
+
+    def _addressed(self, msg: dict, text: str) -> str | None:
+        """In groups: the text meant for us (mention stripped), or None if it isn't for us."""
+        name = self.me.get("username") or ""
+        if text.startswith("/"):
+            target = text.split(maxsplit=1)[0].partition("@")[2]
+            return text if not target or target.lower() == name.lower() else None
+        if name:
+            mention = re.compile(rf"(?<!\w)@{re.escape(name)}\b", re.I)
+            if mention.search(text):
+                return mention.sub("", text).strip()
+        replied = msg.get("reply_to_message") or {}
+        # in forum topics every message "replies" to the topic's creation message; that doesn't count
+        if (replied.get("from") or {}).get("id") == self.me.get("id") and "forum_topic_created" not in replied:
+            return text
+        return None
 
     async def _on_message(self, msg: dict) -> None:
         chat_id = msg["chat"]["id"]
@@ -130,6 +158,16 @@ class Bot:
         role = self.role_of(user)
         thread = msg.get("message_thread_id", 0) if msg.get("is_topic_message") else 0
         ctx = Ctx(chat_id, (user or {}).get("id", 0), role or "", msg, thread)
+        text = msg.get("text") or msg.get("caption") or ""
+        if is_group(msg):
+            text = self._addressed(msg, text)
+            if text is None:
+                return  # group chatter that isn't for us
+            if chat_id not in self.s.allowed_group_ids:
+                log.warning("ignoring group %s: not in ALLOWED_GROUP_IDS", chat_id)
+                if role and text.startswith("/"):
+                    await self.reply(ctx, f"This group ({chat_id}) is not in ALLOWED_GROUP_IDS.")
+                return
         if role is None:
             uid = (user or {}).get("id")
             log.warning("denied message from user %s in chat %s", uid, chat_id)
@@ -140,7 +178,6 @@ class Bot:
         if not self.limiter.allow(user["id"]):
             await self.reply(ctx, "Rate limit reached, please wait a minute.")
             return
-        text = msg.get("text") or msg.get("caption") or ""
         if text.startswith("/"):
             cmd, _, arg = text[1:].partition(" ")
             await self._command(ctx, cmd.split("@")[0].lower(), arg.strip())

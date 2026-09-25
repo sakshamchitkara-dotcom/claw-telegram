@@ -41,4 +41,5 @@ async def harness(backends=None, **settings):
                              allowed_user_ids=frozenset({OWNER}), stream_edit_interval_s=0), **settings)
         async with Telegram(s.telegram_token, s.telegram_api_base) as tg:
             bot = Bot(s, tg, Store(":memory:"), backends or {"echo": EchoBackend()})
+            await bot.init()
             yield Harness(fake, tg, bot)

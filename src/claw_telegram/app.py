@@ -83,6 +83,7 @@ async def run(settings: Settings, stop: asyncio.Event | None = None) -> None:
         log.warning("ALLOWED_USER_IDS is empty: every user will be refused")
     async with Telegram(settings.telegram_token, settings.telegram_api_base) as tg:
         bot = Bot(settings, tg, store, backends, transcriber)
+        await bot.init()
         for b in backends.values():
             if hasattr(b, "start"):
                 b.start()

@@ -40,6 +40,9 @@ class Settings:
     owner_ids: frozenset[int] = field(default_factory=frozenset)
     admin_ids: frozenset[int] = field(default_factory=frozenset)
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
+    # Groups/supergroups the bot talks in (deny by default). There it only answers
+    # messages that mention it, reply to it, or are commands.
+    allowed_group_ids: frozenset[int] = field(default_factory=frozenset)
     # Per-role backend allowlist (None = every configured backend) and approval rights.
     role_backends: dict[str, frozenset[str] | None] = field(default_factory=dict)
     role_can_approve: dict[str, bool] = field(
@@ -97,6 +100,7 @@ class Settings:
             owner_ids=_ids(e.get("OWNER_IDS", "")),
             admin_ids=_ids(e.get("ADMIN_IDS", "")),
             allowed_user_ids=_ids(e.get("ALLOWED_USER_IDS", "")),
+            allowed_group_ids=_ids(e.get("ALLOWED_GROUP_IDS", "")),
             role_backends={r: _names(e.get(f"ROLE_BACKENDS_{r.upper()}")) for r in ROLES},
             role_can_approve={r: _bool(e.get(f"ROLE_APPROVE_{r.upper()}"), r != "user") for r in ROLES},
             mode=mode,
