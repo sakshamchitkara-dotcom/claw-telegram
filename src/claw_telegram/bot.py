@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
-from .backends.base import ApprovalRequest, Backend, BackendError, Status, TextDelta, Turn
+from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
 from .config import Settings
 from .formatting import render, split_plain
 from .ratelimit import RateLimiter
@@ -23,7 +24,18 @@ COMMANDS = [
     ("status", "Backend health and session info"),
     ("tasks", "Recent agent actions and approvals"),
 ]
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_TEXT_DOC_BYTES = 200 * 1024
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yaml", ".yml", ".toml",
+                   ".ini", ".cfg", ".html", ".xml", ".sh", ".sql", ".rs", ".go", ".java", ".c", ".h", ".cpp"}
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
+
+
+def is_text_document(name: str, mime: str | None) -> bool:
+    mime = mime or ""
+    if mime.startswith("text/") or mime in {"application/json", "application/xml", "application/x-yaml"}:
+        return True
+    return os.path.splitext(name.lower())[1] in TEXT_EXTENSIONS
 
 
 class Bot:
@@ -86,10 +98,40 @@ class Bot:
             cmd, _, arg = text[1:].partition(" ")
             await self._command(chat_id, cmd.split("@")[0].lower(), arg.strip())
             return
-        if not text.strip():
-            await self.tg.send_message(chat_id, "I can only handle text messages right now.")
+        try:
+            text, images, problem = await self._attachments(chat_id, msg, text)
+        except TelegramError as e:
+            text, images, problem = "", [], f"Could not download the attachment ({e.description})."
+        if problem:
+            await self.tg.send_message(chat_id, problem)
             return
-        await self._start_turn(chat_id, text, [])
+        if not text.strip() and not images:
+            await self.tg.send_message(chat_id, "Send me text, a photo, a document or a voice note.")
+            return
+        await self._start_turn(chat_id, text, images)
+
+    async def _attachments(self, chat_id: int, msg: dict, text: str) -> tuple[str, list[Image], str | None]:
+        """Pull photos/documents into the turn. Returns (text, images, problem-to-report)."""
+        backend = self.backends[self.backend_name(chat_id)]
+        images: list[Image] = []
+        doc = msg.get("document")
+        if msg.get("photo") or (doc and (doc.get("mime_type") or "").startswith("image/")):
+            if not backend.supports_images:
+                return text, [], f"The {backend.name} backend does not accept images."
+            if msg.get("photo"):
+                file_id, mime = msg["photo"][-1]["file_id"], "image/jpeg"  # last = largest size
+            else:
+                file_id, mime = doc["file_id"], doc["mime_type"]
+            images.append(Image(mime, await self.tg.download_file(file_id, MAX_IMAGE_BYTES)))
+        elif doc:
+            name = doc.get("file_name") or "document"
+            if not is_text_document(name, doc.get("mime_type")):
+                return text, [], f"Can't read {name}: only images and text files are supported."
+            if doc.get("file_size", 0) > MAX_TEXT_DOC_BYTES:
+                return text, [], f"{name} is too large (max {MAX_TEXT_DOC_BYTES // 1024} KB for text files)."
+            body = (await self.tg.download_file(doc["file_id"], MAX_TEXT_DOC_BYTES)).decode("utf-8", "replace")
+            text = f"{text}\n\nAttached file {name}:\n```\n{body}\n```".strip()
+        return text, images, None
 
     async def _start_turn(self, chat_id: int, text: str, images: list) -> None:
         if chat_id in self._busy:
