@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
 
 from .backends.base import ApprovalRequest, Backend, BackendError, Image, Status, TextDelta, Turn
 from .config import Settings
@@ -38,6 +39,15 @@ def is_text_document(name: str, mime: str | None) -> bool:
     if mime.startswith("text/") or mime in {"application/json", "application/xml", "application/x-yaml"}:
         return True
     return os.path.splitext(name.lower())[1] in TEXT_EXTENSIONS
+
+
+@dataclass
+class Ctx:
+    """Who sent a message, where, and with which role."""
+    chat_id: int
+    user_id: int
+    role: str
+    msg: dict
 
 
 class Bot:
@@ -82,15 +92,22 @@ class Bot:
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
+    def role_of(self, user: dict | None) -> str | None:
+        """owner/admin/user, or None for strangers. Env roles win over runtime-added ones."""
+        if not user or user.get("is_bot"):
+            return None
+        return self.s.env_role(user["id"]) or self.store.user_role(user["id"])
+
     def allowed(self, user: dict | None) -> bool:
-        return bool(user) and not user.get("is_bot") and user.get("id") in self.s.allowed_user_ids
+        return self.role_of(user) is not None
 
     # ---- messages ---------------------------------------------------------------
 
     async def _on_message(self, msg: dict) -> None:
         chat_id = msg["chat"]["id"]
         user = msg.get("from")
-        if not self.allowed(user):
+        role = self.role_of(user)
+        if role is None:
             uid = (user or {}).get("id")
             log.warning("denied message from user %s in chat %s", uid, chat_id)
             if msg["chat"].get("type") == "private":
@@ -100,10 +117,11 @@ class Bot:
         if not self.limiter.allow(user["id"]):
             await self.tg.send_message(chat_id, "Rate limit reached, please wait a minute.")
             return
+        ctx = Ctx(chat_id, user["id"], role, msg)
         text = msg.get("text") or msg.get("caption") or ""
         if text.startswith("/"):
             cmd, _, arg = text[1:].partition(" ")
-            await self._command(chat_id, cmd.split("@")[0].lower(), arg.strip())
+            await self._command(ctx, cmd.split("@")[0].lower(), arg.strip())
             return
         try:
             text, images, problem = await self._attachments(chat_id, msg, text)
@@ -115,7 +133,7 @@ class Bot:
         if not text.strip() and not images:
             await self.tg.send_message(chat_id, "Send me text, a photo, a document or a voice note.")
             return
-        await self._start_turn(chat_id, text, images)
+        await self._start_turn(ctx, text, images)
 
     async def _attachments(self, chat_id: int, msg: dict, text: str) -> tuple[str, list[Image], str | None]:
         """Pull photos/documents into the turn. Returns (text, images, problem-to-report)."""
@@ -154,11 +172,16 @@ class Bot:
             text = f"{text}\n\nAttached file {name}:\n```\n{body}\n```".strip()
         return text, images, None
 
-    async def _start_turn(self, chat_id: int, text: str, images: list) -> None:
+    async def _start_turn(self, ctx: Ctx, text: str, images: list) -> None:
+        chat_id = ctx.chat_id
         if chat_id in self._busy:
             await self.tg.send_message(chat_id, "Still working on your previous message, one moment.")
             return
         name = self.backend_name(chat_id)
+        if not self.s.backend_allowed(ctx.role, name):
+            await self.tg.send_message(chat_id, f"Your role ({ctx.role}) can't use the {name} backend. "
+                                                "Pick another with /backend.")
+            return
         self._busy[chat_id] = name
         turn = Turn(chat_id=chat_id, session_id=self.store.session_id(chat_id), text=text,
                     history=self.store.history(chat_id, self.s.history_limit), images=images)
@@ -228,8 +251,8 @@ class Bot:
         chats = [c for c, n in self._busy.items() if n == name]
         if chats:
             chat_id = chats[-1]
-        elif self.s.allowed_user_ids:
-            chat_id = min(self.s.allowed_user_ids)
+        elif self.s.owners:
+            chat_id = min(self.s.owners)
         else:
             log.warning("approval %s from %s dropped: nobody is allowlisted", req.ref, name)
             return
@@ -237,6 +260,7 @@ class Bot:
 
     async def ask_approval(self, chat_id: int, name: str, req: ApprovalRequest) -> None:
         tid = self.store.create_task(chat_id, name, req.ref, req.summary)
+        self.store.audit("request", chat_id=chat_id, task_id=tid, detail=f"{name}: {req.summary[:500]}")
         text = f"🔐 Approval needed (task #{tid}, {name}):\n\n{req.summary[:3500]}"
         keyboard = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"ap:{tid}:1"},
                                          {"text": "❌ Deny", "callback_data": f"ap:{tid}:0"}]]}
@@ -252,6 +276,8 @@ class Bot:
         approved = decision.startswith("allow")
         if not self.store.resolve_task(task.id, "approved" if approved else "denied"):
             return
+        self.store.audit("approve" if approved else "deny", chat_id=task.chat_id, task_id=task.id,
+                         detail=f"{decision} outside Telegram")
         if timer := self._timers.pop(task.id, None):
             timer.cancel()
         if prompt := self._prompts.pop(task.id, None):
@@ -265,6 +291,8 @@ class Bot:
         self._prompts.pop(tid, None)
         task = self.store.get_task(tid)
         if task and self.store.resolve_task(tid, "expired"):
+            self.store.audit("expire", chat_id=chat_id, task_id=tid,
+                             detail=f"no answer in {self.s.approval_timeout_s}s")
             try:
                 await self.backends[task.backend].resolve_approval(task.ref, False)
             except BackendError as e:
@@ -274,7 +302,8 @@ class Bot:
     async def _on_callback(self, cq: dict) -> None:
         user = cq.get("from")
         msg = cq.get("message") or {}
-        if not self.allowed(user):
+        role = self.role_of(user)
+        if role is None:
             log.warning("denied callback from user %s", (user or {}).get("id"))
             await self.tg.answer_callback(cq["id"], "Not authorized.")
             return
@@ -287,6 +316,9 @@ class Bot:
         if task is None or task.chat_id != (msg.get("chat") or {}).get("id"):
             await self.tg.answer_callback(cq["id"], "Unknown task.")
             return
+        if not self.s.can_approve(role):
+            await self.tg.answer_callback(cq["id"], f"Your role ({role}) can't answer approvals.")
+            return
         approve = choice == "1"
         if not self.store.resolve_task(task.id, "approved" if approve else "denied"):
             await self.tg.answer_callback(cq["id"], "Already resolved.")
@@ -296,11 +328,15 @@ class Bot:
         self._prompts.pop(task.id, None)
         who = user.get("username") or user.get("first_name") or str(user["id"])
         outcome = f"✅ Approved by {who}" if approve else f"❌ Denied by {who}"
+        detail = task.summary[:500]
         try:
             await self.backends[task.backend].resolve_approval(task.ref, approve)
         except (BackendError, KeyError) as e:
             self.store.set_task_status(task.id, "error")
             outcome += f", but the backend did not accept it: {e}"
+            detail += f" [backend error: {e}]"
+        self.store.audit("approve" if approve else "deny", user_id=user["id"], chat_id=task.chat_id,
+                         task_id=task.id, detail=detail)
         await self.tg.answer_callback(cq["id"], outcome[:190])
         await self._safe_edit(task.chat_id, msg["message_id"], f"{msg.get('text', '')}\n\n{outcome}")
 
@@ -328,41 +364,47 @@ class Bot:
 
     # ---- commands -----------------------------------------------------------------
 
-    async def _command(self, chat_id: int, cmd: str, arg: str) -> None:
+    async def _command(self, ctx: Ctx, cmd: str, arg: str) -> None:
         handler = getattr(self, f"cmd_{cmd}", None)
         if handler is None:
-            await self.tg.send_message(chat_id, f"Unknown command /{cmd}. Try /help.")
+            await self.tg.send_message(ctx.chat_id, f"Unknown command /{cmd}. Try /help.")
             return
-        await handler(chat_id, arg)
+        await handler(ctx, arg)
 
-    async def cmd_start(self, chat_id: int, arg: str) -> None:
+    async def cmd_start(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
         text = (f"Hi! I'm your personal assistant, backed by <b>{self.backend_name(chat_id)}</b>. "
                 "Just send a message. /help lists commands.")
         await self.tg.send_message(chat_id, text, parse_mode="HTML")
 
-    async def cmd_help(self, chat_id: int, arg: str) -> None:
+    async def cmd_help(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
         lines = [f"/{c} - {d}" for c, d in COMMANDS]
         lines += ["", "Send text, photos or documents. Side-effecting agent actions ask for approval first."]
         await self.tg.send_message(chat_id, "\n".join(lines))
 
-    async def cmd_reset(self, chat_id: int, arg: str) -> None:
+    async def cmd_reset(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
         self.store.reset(chat_id)
         await self.tg.send_message(chat_id, "Conversation cleared. New session started.")
 
-    async def cmd_backend(self, chat_id: int, arg: str) -> None:
+    async def cmd_backend(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
         current = self.backend_name(chat_id)
+        usable = [n for n in self.backends if self.s.backend_allowed(ctx.role, n)]
         if not arg:
-            lines = [("• " if n == current else "  ") + n for n in self.backends]
+            lines = [("• " if n == current else "  ") + n for n in usable]
             await self.tg.send_message(chat_id, "Backends (• = active):\n" + "\n".join(lines)
                                        + "\n\nSwitch with /backend <name>.")
             return
-        if arg not in self.backends:
-            await self.tg.send_message(chat_id, f"Unknown backend {arg!r}. Available: {', '.join(self.backends)}")
+        if arg not in usable:
+            await self.tg.send_message(chat_id, f"Unknown backend {arg!r}. Available: {', '.join(usable)}")
             return
         self.store.set_backend(chat_id, arg)
         await self.tg.send_message(chat_id, f"Switched to {arg}.")
 
-    async def cmd_status(self, chat_id: int, arg: str) -> None:
+    async def cmd_status(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
         name = self.backend_name(chat_id)
         try:
             health = await asyncio.wait_for(self.backends[name].health(), timeout=8)
@@ -376,7 +418,8 @@ class Bot:
             f"uptime: {up // 3600}h{up % 3600 // 60:02d}m",
         ]))
 
-    async def cmd_tasks(self, chat_id: int, arg: str) -> None:
+    async def cmd_tasks(self, ctx: Ctx, arg: str) -> None:
+        chat_id = ctx.chat_id
         tasks = self.store.list_tasks(chat_id)
         if not tasks:
             await self.tg.send_message(chat_id, "No agent tasks yet.")
