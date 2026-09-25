@@ -7,6 +7,7 @@ upgrade it in order and PRAGMA user_version records how far a database got.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -55,6 +56,13 @@ CREATE TABLE IF NOT EXISTS schedules (
     created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS schedules_due ON schedules (next_run);
+CREATE TABLE IF NOT EXISTS pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    chunks TEXT NOT NULL,  -- JSON list of rendered pages
+    html INTEGER NOT NULL,
+    created REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -266,3 +274,17 @@ class Store:
 
     def delete_schedule(self, sid: int) -> bool:
         return self.db.execute("DELETE FROM schedules WHERE id = ?", (sid,)).rowcount == 1
+
+    # ---- paginated long replies ------------------------------------------------
+
+    PAGES_TTL_S = 7 * 86400
+
+    def add_pages(self, chat_id: int, chunks: list[str], html: bool) -> int:
+        now = time.time()
+        self.db.execute("DELETE FROM pages WHERE created < ?", (now - self.PAGES_TTL_S,))
+        return self.db.execute("INSERT INTO pages (chat_id, chunks, html, created) VALUES (?, ?, ?, ?)",
+                               (chat_id, json.dumps(chunks), int(html), now)).lastrowid
+
+    def get_pages(self, pid: int) -> tuple[int, list[str], bool] | None:
+        row = self.db.execute("SELECT chat_id, chunks, html FROM pages WHERE id = ?", (pid,)).fetchone()
+        return (row[0], json.loads(row[1]), bool(row[2])) if row else None

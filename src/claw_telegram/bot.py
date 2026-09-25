@@ -46,6 +46,17 @@ PREVIEW_CHARS = 1500  # shown in the chat when a long reply is sent as a file
 LIVE_LIMIT = 3800  # chars shown while streaming; the final render splits properly
 
 
+def pager(pid: int, n: int, chunks: list[str]) -> dict | None:
+    """◀ Prev | n/N | Show more ▶ keyboard for page n (None when there is only one page)."""
+    if len(chunks) < 2:
+        return None
+    row = [{"text": "◀ Prev", "callback_data": f"pg:{pid}:{n - 1}"}] if n > 0 else []
+    row.append({"text": f"{n + 1}/{len(chunks)}", "callback_data": f"pg:{pid}:{n}"})
+    if n < len(chunks) - 1:
+        row.append({"text": "Show more ▶", "callback_data": f"pg:{pid}:{n + 1}"})
+    return {"inline_keyboard": [row]}
+
+
 def is_group(msg: dict) -> bool:
     return (msg.get("chat") or {}).get("type") in {"group", "supergroup"}
 
@@ -399,6 +410,9 @@ class Bot:
             return
         kind, _, rest = (cq.get("data") or "").partition(":")
         tid_s, _, choice = rest.partition(":")
+        if kind == "pg" and tid_s.isdigit() and choice.isdigit():
+            await self._turn_page(cq, int(tid_s), int(choice))
+            return
         if kind != "ap" or not tid_s.isdigit() or choice not in {"0", "1"}:
             await self.tg.answer_callback(cq["id"], "Unknown action.")
             return
@@ -441,19 +455,29 @@ class Bot:
         if 0 < self.s.long_reply_file_chars < len(md):
             await self._deliver_file(chat_id, mid, md, thread)
             return
+        chunks = render(md)
+        pid = self.store.add_pages(chat_id, chunks, html=True) if len(chunks) > 1 else 0
         try:
-            chunks, mode = render(md), "HTML"
-            await self.tg.edit_message(chat_id, mid, chunks[0], parse_mode=mode)
+            await self.tg.edit_message(chat_id, mid, chunks[0], parse_mode="HTML", reply_markup=pager(pid, 0, chunks))
         except TelegramError as e:
             log.info("HTML rejected (%s), falling back to plain text", e.description)
-            chunks, mode = split_plain(md), None
-            await self.tg.edit_message(chat_id, mid, chunks[0])
-        for chunk in chunks[1:]:
-            try:
-                await self.tg.send_message(chat_id, chunk, parse_mode=mode, thread_id=thread)
-            except TelegramError:
-                for part in split_plain(chunk):
-                    await self.tg.send_message(chat_id, part, thread_id=thread)
+            chunks = split_plain(md)
+            pid = self.store.add_pages(chat_id, chunks, html=False) if len(chunks) > 1 else 0
+            await self.tg.edit_message(chat_id, mid, chunks[0], reply_markup=pager(pid, 0, chunks))
+
+    async def _turn_page(self, cq: dict, pid: int, n: int) -> None:
+        msg = cq.get("message") or {}
+        pages = self.store.get_pages(pid)
+        if pages is None or pages[0] != (msg.get("chat") or {}).get("id") or not 0 <= n < len(pages[1]):
+            await self.tg.answer_callback(cq["id"], "These pages have expired.")
+            return
+        _, chunks, html_mode = pages
+        await self.tg.answer_callback(cq["id"])
+        try:
+            await self.tg.edit_message(msg["chat"]["id"], msg["message_id"], chunks[n],
+                                       parse_mode="HTML" if html_mode else None, reply_markup=pager(pid, n, chunks))
+        except TelegramError as e:
+            log.warning("page %s/%s of %s failed: %s", n + 1, len(chunks), pid, e)
 
     async def _deliver_file(self, chat_id: int, mid: int, md: str, thread: int) -> None:
         """Very long reply: a short preview in the chat, the whole thing as a Markdown file."""

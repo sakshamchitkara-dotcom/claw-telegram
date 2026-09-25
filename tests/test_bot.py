@@ -98,7 +98,7 @@ async def test_rate_limit():
         assert h.fake.texts(OWNER)[-1] == "Rate limit reached, please wait a minute."
 
 
-async def test_streaming_edits_and_long_reply_split_with_html():
+async def test_streaming_edits_and_long_reply_paginates_with_show_more():
     class Long(Backend):
         name = "long"
 
@@ -109,12 +109,27 @@ async def test_streaming_edits_and_long_reply_split_with_html():
     async with harness(backends={"long": Long()}, default_backend="long", long_reply_file_chars=0) as h:
         h.fake.push_message(OWNER, "go")
         await h.pump()
-        sent = h.fake.sent(OWNER)
-        assert len(sent) >= 5
-        assert all(m["parse_mode"] == "HTML" and len(m["text"]) <= 4096 for m in sent)
-        assert sent[0]["edits"] > 2  # streamed as it arrived
-        assert "<b>line 0</b> &lt;x&gt; &amp;" in sent[0]["text"]
-        assert "line 299" in sent[-1]["text"]
+        (msg,) = h.fake.sent(OWNER)  # one message, paged in place
+        assert msg["edits"] > 2  # streamed as it arrived
+        assert msg["parse_mode"] == "HTML" and "<b>line 0</b> &lt;x&gt; &amp;" in msg["text"]
+        row = msg["reply_markup"]["inline_keyboard"][0]
+        total = int(row[0]["text"].split("/")[1])
+        assert total >= 5 and [b["text"] for b in row] == [f"1/{total}", "Show more ▶"]
+        seen = [msg["text"]]
+        for _ in range(total - 1):
+            nxt = msg["reply_markup"]["inline_keyboard"][0][-1]["callback_data"]
+            h.fake.push_callback(OWNER, dict(msg), nxt)
+            await h.pump()
+            seen.append(msg["text"])
+            assert len(msg["text"]) <= 4096 and msg["parse_mode"] == "HTML"
+        assert "line 299" in seen[-1] and len(set(seen)) == total
+        assert [b["text"] for b in msg["reply_markup"]["inline_keyboard"][0]] == ["◀ Prev", f"{total}/{total}"]
+        h.fake.push_callback(OWNER, dict(msg), "pg:1:0")  # back to the start
+        h.fake.push_callback(OWNER, dict(msg, chat={"id": 555}), "pg:1:1")  # pages of another chat
+        await h.pump()
+        assert msg["text"] == seen[0]
+        answers = [p.get("text") for m, p in h.fake.calls if m == "answerCallbackQuery"]
+        assert answers[-1] == "These pages have expired."
 
 
 async def test_busy_chat_rejects_concurrent_message():
