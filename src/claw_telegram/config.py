@@ -15,6 +15,15 @@ def _ids(raw: str) -> frozenset[int]:
     return frozenset(out)
 
 
+def _names(raw: str | None) -> frozenset[str] | None:
+    """Comma-separated backend names; empty or "*" means no restriction (None)."""
+    names = frozenset(n.strip() for n in (raw or "").split(",") if n.strip())
+    return None if not names or "*" in names else names
+
+
+ROLES = ("owner", "admin", "user")  # highest first
+
+
 def _bool(raw: str | None, default: bool = False) -> bool:
     if raw is None or raw == "":
         return default
@@ -26,7 +35,15 @@ class Settings:
     telegram_token: str
     telegram_api_base: str = "https://api.telegram.org"
     # Deny by default: an empty allowlist means nobody can use the bot.
+    # Roles: owner > admin > user. If owner_ids is empty, allowed_user_ids are all
+    # owners (the single-tier behaviour of 0.1.x); otherwise they are plain users.
+    owner_ids: frozenset[int] = field(default_factory=frozenset)
+    admin_ids: frozenset[int] = field(default_factory=frozenset)
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
+    # Per-role backend allowlist (None = every configured backend) and approval rights.
+    role_backends: dict[str, frozenset[str] | None] = field(default_factory=dict)
+    role_can_approve: dict[str, bool] = field(
+        default_factory=lambda: {"owner": True, "admin": True, "user": False})
     mode: str = "polling"  # polling | webhook
     webhook_url: str = ""
     webhook_secret: str = ""
@@ -75,7 +92,11 @@ class Settings:
         return cls(
             telegram_token=token,
             telegram_api_base=e.get("TELEGRAM_API_BASE", cls.telegram_api_base).rstrip("/"),
+            owner_ids=_ids(e.get("OWNER_IDS", "")),
+            admin_ids=_ids(e.get("ADMIN_IDS", "")),
             allowed_user_ids=_ids(e.get("ALLOWED_USER_IDS", "")),
+            role_backends={r: _names(e.get(f"ROLE_BACKENDS_{r.upper()}")) for r in ROLES},
+            role_can_approve={r: _bool(e.get(f"ROLE_APPROVE_{r.upper()}"), r != "user") for r in ROLES},
             mode=mode,
             webhook_url=e.get("WEBHOOK_URL", ""),
             webhook_secret=secret,
@@ -104,3 +125,24 @@ class Settings:
             transcribe_key=e.get("TRANSCRIBE_API_KEY", ""),
             transcribe_model=e.get("TRANSCRIBE_MODEL", cls.transcribe_model),
         )
+
+    def env_role(self, user_id: int) -> str | None:
+        """Role granted by the environment (runtime-added users live in the store)."""
+        if user_id in self.owner_ids or (not self.owner_ids and user_id in self.allowed_user_ids):
+            return "owner"
+        if user_id in self.admin_ids:
+            return "admin"
+        if user_id in self.allowed_user_ids:
+            return "user"
+        return None
+
+    @property
+    def owners(self) -> frozenset[int]:
+        return self.owner_ids or self.allowed_user_ids
+
+    def backend_allowed(self, role: str, backend: str) -> bool:
+        allowed = self.role_backends.get(role)
+        return allowed is None or backend in allowed
+
+    def can_approve(self, role: str | None) -> bool:
+        return bool(role) and self.role_can_approve.get(role, False)
