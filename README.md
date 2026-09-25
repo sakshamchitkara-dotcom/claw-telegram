@@ -131,15 +131,15 @@ owner 4242: /tasks
 GET /healthz -> 200 {"ok": true, "mode": "polling", "backends": ["echo"], "uptime_s": 12, "updates": 7, ...}
 ```
 
-Live OpenClaw 2026.9.6 gateway (Ollama `hermes3:3b` as its model):
+Live OpenClaw 2026.9.6 gateway (Ollama `hermes3:3b` as its model): The name in the transcript is substituted; the rest is verbatim.
 
 ```
 owner 4242: /status
   bot: backend: openclaw (ok (3 models, openclaw/default present); approvals ws connected)
-owner 4242: My name is Ayaan. Reply with just: hello <my name>
-  bot (HTML, 2 edits): hello Ayaan
+owner 4242: My name is Alex. Reply with just: hello <my name>
+  bot (HTML, 2 edits): hello Alex
 owner 4242: What is my name? One word.
-  bot (HTML, 2 edits): Ayaan
+  bot (HTML, 2 edits): Alex
 --- exec approval raised on the gateway (openclaw gateway call exec.approval.request) ---
 telegram prompt: '🔐 Approval needed (task #1, openclaw):\n\nexec on gateway: rm -rf /tmp/claw-demo' ['✅ Approve', '❌ Deny']
 exec.approval.request returned: {"id": "b1294d24-...", "decision": "allow-once", ...}
