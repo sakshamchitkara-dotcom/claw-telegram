@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from .backends.base import Backend, BackendError, Status, TextDelta, Turn
+from .backends.base import ApprovalRequest, Backend, BackendError, Status, TextDelta, Turn
 from .config import Settings
 from .formatting import render, split_plain
 from .ratelimit import RateLimiter
@@ -34,8 +34,12 @@ class Bot:
         self.backends = backends
         self.limiter = RateLimiter(settings.rate_limit_per_minute)
         self.started = time.time()
-        self._busy: set[int] = set()
+        self._busy: dict[int, str] = {}  # chat_id -> backend name of the in-flight turn
         self._tasks: set[asyncio.Task] = set()
+        self._timers: dict[int, asyncio.Task] = {}  # approval task id -> expiry timer
+        for name, backend in backends.items():
+            if hasattr(backend, "approval_sink"):  # backends that raise approvals out of band
+                backend.approval_sink = lambda req, name=name: self._external_approval(name, req)
 
     # ---- entry point ----------------------------------------------------------
 
@@ -44,6 +48,8 @@ class Bot:
         try:
             if "message" in update:
                 await self._on_message(update["message"])
+            elif "callback_query" in update:
+                await self._on_callback(update["callback_query"])
         except Exception:
             log.exception("failed to handle update %s", update.get("update_id"))
 
@@ -89,8 +95,8 @@ class Bot:
         if chat_id in self._busy:
             await self.tg.send_message(chat_id, "Still working on your previous message, one moment.")
             return
-        self._busy.add(chat_id)
         name = self.backend_name(chat_id)
+        self._busy[chat_id] = name
         turn = Turn(chat_id=chat_id, session_id=self.store.session_id(chat_id), text=text,
                     history=self.store.history(chat_id, self.s.history_limit), images=images)
         self.spawn(self._run_turn(name, turn))
@@ -103,7 +109,7 @@ class Bot:
         try:
             await self._stream_turn(name, turn)
         finally:
-            self._busy.discard(turn.chat_id)
+            self._busy.pop(turn.chat_id, None)
 
     async def _stream_turn(self, name: str, turn: Turn) -> None:
         chat_id = turn.chat_id
@@ -143,7 +149,79 @@ class Bot:
         await self._deliver(chat_id, mid, text)
 
     async def _on_backend_event(self, name: str, turn: Turn, ev) -> None:
-        log.info("ignoring unsupported backend event %r", ev)
+        if isinstance(ev, ApprovalRequest):
+            await self.ask_approval(turn.chat_id, name, ev)
+        else:
+            log.info("ignoring unsupported backend event %r", ev)
+
+    # ---- approvals ------------------------------------------------------------------
+
+    async def _external_approval(self, name: str, req: ApprovalRequest) -> None:
+        """Approval raised outside a reply stream (OpenClaw exec approvals).
+
+        Routed to the chat currently waiting on that backend, else to the first
+        allowlisted user's private chat.
+        """
+        chats = [c for c, n in self._busy.items() if n == name]
+        if chats:
+            chat_id = chats[-1]
+        elif self.s.allowed_user_ids:
+            chat_id = min(self.s.allowed_user_ids)
+        else:
+            log.warning("approval %s from %s dropped: nobody is allowlisted", req.ref, name)
+            return
+        await self.ask_approval(chat_id, name, req)
+
+    async def ask_approval(self, chat_id: int, name: str, req: ApprovalRequest) -> None:
+        tid = self.store.create_task(chat_id, name, req.ref, req.summary)
+        text = f"🔐 Approval needed (task #{tid}, {name}):\n\n{req.summary[:3500]}"
+        keyboard = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"ap:{tid}:1"},
+                                         {"text": "❌ Deny", "callback_data": f"ap:{tid}:0"}]]}
+        msg = await self.tg.send_message(chat_id, text, reply_markup=keyboard)
+        self._timers[tid] = asyncio.create_task(self._expire(tid, chat_id, msg["message_id"], text))
+
+    async def _expire(self, tid: int, chat_id: int, mid: int, text: str) -> None:
+        await asyncio.sleep(self.s.approval_timeout_s)
+        self._timers.pop(tid, None)
+        task = self.store.get_task(tid)
+        if task and self.store.resolve_task(tid, "expired"):
+            try:
+                await self.backends[task.backend].resolve_approval(task.ref, False)
+            except BackendError as e:
+                log.warning("could not deny expired approval %s: %s", tid, e)
+            await self._safe_edit(chat_id, mid, f"{text}\n\n⌛ No answer in {self.s.approval_timeout_s}s: denied.")
+
+    async def _on_callback(self, cq: dict) -> None:
+        user = cq.get("from")
+        msg = cq.get("message") or {}
+        if not self.allowed(user):
+            log.warning("denied callback from user %s", (user or {}).get("id"))
+            await self.tg.answer_callback(cq["id"], "Not authorized.")
+            return
+        kind, _, rest = (cq.get("data") or "").partition(":")
+        tid_s, _, choice = rest.partition(":")
+        if kind != "ap" or not tid_s.isdigit() or choice not in {"0", "1"}:
+            await self.tg.answer_callback(cq["id"], "Unknown action.")
+            return
+        task = self.store.get_task(int(tid_s))
+        if task is None or task.chat_id != (msg.get("chat") or {}).get("id"):
+            await self.tg.answer_callback(cq["id"], "Unknown task.")
+            return
+        approve = choice == "1"
+        if not self.store.resolve_task(task.id, "approved" if approve else "denied"):
+            await self.tg.answer_callback(cq["id"], "Already resolved.")
+            return
+        if timer := self._timers.pop(task.id, None):
+            timer.cancel()
+        who = user.get("username") or user.get("first_name") or str(user["id"])
+        outcome = f"✅ Approved by {who}" if approve else f"❌ Denied by {who}"
+        try:
+            await self.backends[task.backend].resolve_approval(task.ref, approve)
+        except (BackendError, KeyError) as e:
+            self.store.set_task_status(task.id, "error")
+            outcome += f", but the backend did not accept it: {e}"
+        await self.tg.answer_callback(cq["id"], outcome[:190])
+        await self._safe_edit(task.chat_id, msg["message_id"], f"{msg.get('text', '')}\n\n{outcome}")
 
     async def _safe_edit(self, chat_id: int, mid: int, text: str) -> None:
         try:

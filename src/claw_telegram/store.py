@@ -107,6 +107,9 @@ class Store:
                               (status, time.time(), task_id))
         return cur.rowcount == 1
 
+    def set_task_status(self, task_id: int, status: str) -> None:
+        self.db.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
     def list_tasks(self, chat_id: int, limit: int = 10) -> list[Task]:
         rows = self.db.execute("SELECT id, chat_id, backend, ref, summary, status, created FROM tasks "
                                "WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (chat_id, limit)).fetchall()
