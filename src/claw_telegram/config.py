@@ -6,6 +6,7 @@ import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 # Telegram's published webhook source ranges (core.telegram.org/bots/webhooks)
@@ -40,6 +41,21 @@ def _names(raw: str | None) -> frozenset[str] | None:
 
 
 ROLES = ("owner", "admin", "user")  # highest first
+
+
+def _zone_name(timezone: str | None, tz: str | None) -> str:
+    """TIMEZONE must be a valid IANA name. TZ is only used when it is one: libc forms such as
+    ":/etc/localtime" or "EST5EDT4,M3.2.0" mean "ask the host", which local_zone() does anyway."""
+    if timezone:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise SystemExit(f"TIMEZONE={timezone!r} is not an IANA time zone name (e.g. Europe/Berlin)") from None
+        return timezone
+    try:
+        return tz if tz and ZoneInfo(tz) else ""
+    except (ZoneInfoNotFoundError, ValueError):
+        return ""
 
 
 def _bool(raw: str | None, default: bool = False) -> bool:
@@ -167,7 +183,7 @@ class Settings:
             idle_timeout_s=float(e.get("IDLE_TIMEOUT_S", cls.idle_timeout_s)),
             stream_edit_interval_s=float(e.get("STREAM_EDIT_INTERVAL_S", cls.stream_edit_interval_s)),
             long_reply_file_chars=int(e.get("LONG_REPLY_FILE_CHARS", cls.long_reply_file_chars)),
-            timezone=e.get("TIMEZONE") or e.get("TZ", ""),
+            timezone=_zone_name(e.get("TIMEZONE"), e.get("TZ")),
             max_schedules_per_user=int(e.get("MAX_SCHEDULES_PER_USER", cls.max_schedules_per_user)),
             system_prompt=e.get("SYSTEM_PROMPT", cls.system_prompt),
             openclaw_url=e.get("OPENCLAW_URL", "").rstrip("/"),

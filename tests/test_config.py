@@ -55,3 +55,13 @@ def test_webhook_secret_format():
         with pytest.raises(SystemExit):
             Settings.from_env(base | {"WEBHOOK_SECRET": bad})
     assert Settings.from_env(base | {"WEBHOOK_SECRET": "A-good_secret_0123456789"}).webhook_secret
+
+
+def test_timezone_validation():
+
+    env = {"TELEGRAM_BOT_TOKEN": "t"}
+    assert Settings.from_env({**env, "TIMEZONE": "Asia/Kolkata", "TZ": "UTC"}).timezone == "Asia/Kolkata"
+    assert Settings.from_env({**env, "TZ": "Europe/Berlin"}).timezone == "Europe/Berlin"
+    assert Settings.from_env({**env, "TZ": ":/etc/localtime"}).timezone == ""  # libc form: use the host zone
+    with pytest.raises(SystemExit, match="not an IANA time zone"):
+        Settings.from_env({**env, "TIMEZONE": "Mars/Olympus"})
